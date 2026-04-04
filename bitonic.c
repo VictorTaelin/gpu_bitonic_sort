@@ -1,5 +1,3 @@
-//./bitonic.js//
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -52,9 +50,71 @@ Tree gen(uint32_t d, uint32_t x) {
   if (d == 0) {
     return Leaf(x);
   } else {
+    // PARALLEL:
     Tree xl = gen(d - 1, x * 2 + 1);
     Tree xr = gen(d - 1, x * 2);
     return Node(xl, xr);
+  }
+}
+
+Tree warp_swap(uint32_t c, uint32_t av, uint32_t bv) {
+  if (c == 0) {
+    return Node(Leaf(av), Leaf(bv));
+  } else {
+    return Node(Leaf(bv), Leaf(av));
+  }
+}
+
+Tree warp(uint32_t d, uint32_t s, Tree a, Tree b) {
+  if (d == 0) {
+    uint32_t av = get_val(a);
+    uint32_t bv = get_val(b);
+    return warp_swap(s ^ (av > bv ? 1 : 0), av, bv);
+  } else {
+    // PARALLEL:
+    Tree wa = warp(d - 1, s, get_l(a), get_l(b));
+    Tree wb = warp(d - 1, s, get_r(a), get_r(b));
+    return Node(Node(get_l(wa), get_l(wb)), Node(get_r(wa), get_r(wb)));
+  }
+}
+
+Tree flow(uint32_t d, uint32_t s, Tree t);
+Tree down(uint32_t d, uint32_t s, Tree t);
+
+Tree flow(uint32_t d, uint32_t s, Tree t) {
+  if (d == 0) {
+    return t;
+  } else if (!is_node(t)) {
+    return t;
+  } else {
+    Tree warped = warp(d - 1, s, get_l(t), get_r(t));
+    return down(d, s, warped);
+  }
+}
+
+Tree down(uint32_t d, uint32_t s, Tree t) {
+  if (d == 0) {
+    return t;
+  } else if (!is_node(t)) {
+    return t;
+  } else {
+    // PARALLEL:
+    Tree tl = flow(d - 1, s, get_l(t));
+    Tree tr = flow(d - 1, s, get_r(t));
+    return Node(tl, tr);
+  }
+}
+
+Tree sort(uint32_t d, uint32_t s, Tree t) {
+  if (d == 0) {
+    return t;
+  } else if (!is_node(t)) {
+    return t;
+  } else {
+    // PARALLEL:
+    Tree sl = sort(d - 1, 0, get_l(t));
+    Tree sr = sort(d - 1, 1, get_r(t));
+    return flow(d, s, Node(sl, sr));
   }
 }
 
@@ -73,63 +133,6 @@ uint64_t checksum(Tree t) {
   return (uint64_t)result;
 }
 
-Tree warp_swap(uint32_t c, uint32_t av, uint32_t bv) {
-  if (c == 0) {
-    return Node(Leaf(av), Leaf(bv));
-  } else {
-    return Node(Leaf(bv), Leaf(av));
-  }
-}
-
-Tree warp(uint32_t d, uint32_t s, Tree a, Tree b) {
-  if (d == 0) {
-    uint32_t av = get_val(a);
-    uint32_t bv = get_val(b);
-    return warp_swap(s ^ (av > bv ? 1 : 0), av, bv);
-  } else {
-    Tree wa = warp(d - 1, s, get_l(a), get_l(b));
-    Tree wb = warp(d - 1, s, get_r(a), get_r(b));
-    return Node(Node(get_l(wa), get_l(wb)), Node(get_r(wa), get_r(wb)));
-  }
-}
-
-Tree flow(uint32_t d, uint32_t s, Tree t);
-Tree down(uint32_t d, uint32_t s, Tree t);
-
-Tree flow(uint32_t d, uint32_t s, Tree t) {
-  if (d == 0) {
-    return t;
-  } else {
-    Tree warped = warp(d - 1, s, get_l(t), get_r(t));
-    return down(d, s, warped);
-  }
-}
-
-Tree down(uint32_t d, uint32_t s, Tree t) {
-  if (d == 0) {
-    return t;
-  } else if (!is_node(t)) {
-    return t;
-  } else {
-    Tree tl = flow(d - 1, s, get_l(t));
-    Tree tr = flow(d - 1, s, get_r(t));
-    return Node(tl, tr);
-  }
-}
-
-uint32_t depth(Tree t) {
-  if (!is_node(t)) {
-    return 0;
-  } else {
-    return 1 + depth(get_l(t));
-  }
-}
-
-Tree sort_tree(Tree t) {
-  uint32_t d = depth(t);
-  return flow(d, 0, t);
-}
-
 int main(void) {
   size_t heap_elems = (uint64_t)1 << 42;
   size_t heap_bytes = heap_elems * sizeof(uint64_t);
@@ -139,26 +142,8 @@ int main(void) {
     fprintf(stderr, "mmap failed\n");
     return 1;
   }
-  printf("%" PRIu64 "\n", checksum(sort_tree(gen(20, 0))));
-
-  double used_bytes = (double)heap_max * sizeof(uint64_t);
-  const char* unit;
-  double display;
-  if (used_bytes >= (1024.0 * 1024.0 * 1024.0)) {
-    display = used_bytes / (1024.0 * 1024.0 * 1024.0);
-    unit = "GiB";
-  } else if (used_bytes >= (1024.0 * 1024.0)) {
-    display = used_bytes / (1024.0 * 1024.0);
-    unit = "MiB";
-  } else if (used_bytes >= 1024.0) {
-    display = used_bytes / 1024.0;
-    unit = "KiB";
-  } else {
-    display = used_bytes;
-    unit = "bytes";
-  }
-  fprintf(stderr, "heap_used: %" PRIu64 " slots (%" PRIu64 " bytes, %.2f %s)\n", heap_max, heap_max * sizeof(uint64_t), display, unit);
-
+  printf("%" PRIu64 "\n", checksum(sort(20, 0, gen(20, 0))));
+  fprintf(stderr, "heap_used: %.2f GiB\n", (double)(heap_max * sizeof(uint64_t)) / (1024.0 * 1024.0 * 1024.0));
   munmap(heap, heap_bytes);
   return 0;
 }
