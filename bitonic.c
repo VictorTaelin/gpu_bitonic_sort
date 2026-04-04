@@ -1,188 +1,158 @@
-// bitonic.c — Sequential recursive bitonic sort
-//
-// Four mutually recursive functions on a binary tree:
-//   sort(d, s, t)    — sort subtree t of depth d in direction s
-//   flow(d, s, t)    — apply bitonic flow network
-//   warp(d, s, a, b) — pairwise compare-swap across two subtrees
-//   down(d, s, t)    — recurse flow on children
-//
-// Compilation: gcc -O3 -o bitonic_c bitonic.c
-// Usage:       ./bitonic_c [depth=20] [heap_gb=16]
+//./bitonic.js//
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <time.h>
+#include <inttypes.h>
+#include <sys/mman.h>
 
-typedef uint32_t u32;
-typedef uint64_t u64;
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE 0
+#endif
 
-// ---------------------------------------------------------------------------
-// Heap + tree encoding
-//
-// Tree nodes are 2 words each in a flat heap array.
-// All allocations are 2-word aligned, so pointers are always even.
-// We use bit 0 of word1 as the node/leaf tag:
-//   Leaf: [value, 1]       (word1 is odd)
-//   Node: [left,  right]   (word1 is even, since right is a valid pointer)
-// This allows pointers to use the full 32-bit range (up to 16 GB heap).
-// ---------------------------------------------------------------------------
+typedef uint64_t Tree;
 
-static u32 *heap;
-static u32 heap_ptr;
+static uint64_t* heap;
+static uint64_t heap_pos = 0;
+static uint64_t heap_max = 0;
 
-static inline int  is_node(u32 p) { return !(heap[p + 1] & 1); }
-static inline u32  get_val(u32 p) { return heap[p]; }
-static inline u32  tree_left(u32 p)  { return heap[p]; }
-static inline u32  tree_right(u32 p) { return heap[p + 1]; }
-
-static inline u32 make_leaf(u32 value) {
-    u32 p = heap_ptr;
-    heap_ptr += 2;
-    heap[p]     = value;
-    heap[p + 1] = 1;
-    return p;
+static inline Tree Leaf(uint32_t v) {
+  return (uint64_t)v << 1;
 }
 
-static inline u32 make_node(u32 left, u32 right) {
-    u32 p = heap_ptr;
-    heap_ptr += 2;
-    heap[p]     = left;
-    heap[p + 1] = right;
-    return p;
+static inline Tree Node(Tree l, Tree r) {
+  uint64_t loc = heap_pos;
+  heap[heap_pos++] = l;
+  heap[heap_pos++] = r;
+  if (heap_pos > heap_max) {
+    heap_max = heap_pos;
+  }
+  return (loc << 1) | 1;
 }
 
-// ---------------------------------------------------------------------------
-// Tree generation
-// Builds a complete binary tree of depth d with leaves [2^d-1 .. 0].
-// ---------------------------------------------------------------------------
-
-static u32 gen(u32 depth, u32 x) {
-    if (depth == 0) {
-        return make_leaf(x);
-    }
-    u32 l = gen(depth - 1, x * 2 + 1);
-    u32 r = gen(depth - 1, x * 2);
-    return make_node(l, r);
+static inline uint32_t is_node(Tree t) {
+  return t & 1;
 }
 
-// ---------------------------------------------------------------------------
-// Bitonic sort
-// ---------------------------------------------------------------------------
-
-static u32 warp(u32 depth, u32 dir, u32 a, u32 b) {
-    if (depth == 0) {
-        if (is_node(a) || is_node(b)) {
-            return make_leaf(0);
-        }
-        u32 va = get_val(a);
-        u32 vb = get_val(b);
-        u32 do_swap = dir ^ (va > vb);
-        u32 lo = do_swap ? vb : va;
-        u32 hi = do_swap ? va : vb;
-        return make_node(make_leaf(lo), make_leaf(hi));
-    }
-    if (!is_node(a) || !is_node(b)) {
-        return make_leaf(0);
-    }
-    u32 wa = warp(depth - 1, dir, tree_left(a), tree_left(b));
-    u32 wb = warp(depth - 1, dir, tree_right(a), tree_right(b));
-    if (!is_node(wa) || !is_node(wb)) {
-        return make_leaf(0);
-    }
-    return make_node(make_node(tree_left(wa), tree_left(wb)),
-                     make_node(tree_right(wa), tree_right(wb)));
+static inline uint32_t get_val(Tree t) {
+  return (uint32_t)(t >> 1);
 }
 
-static u32 flow(u32 depth, u32 dir, u32 tree);
-
-static u32 down(u32 depth, u32 dir, u32 tree) {
-    if (depth == 0 || !is_node(tree)) {
-        return tree;
-    }
-    u32 l = flow(depth - 1, dir, tree_left(tree));
-    u32 r = flow(depth - 1, dir, tree_right(tree));
-    return make_node(l, r);
+static inline Tree get_l(Tree t) {
+  uint64_t loc = t >> 1;
+  return heap[loc];
 }
 
-static u32 flow(u32 depth, u32 dir, u32 tree) {
-    if (depth == 0 || !is_node(tree)) {
-        return tree;
-    }
-    u32 warped = warp(depth - 1, dir, tree_left(tree), tree_right(tree));
-    return down(depth, dir, warped);
+static inline Tree get_r(Tree t) {
+  uint64_t loc = t >> 1;
+  return heap[loc + 1];
 }
 
-static u32 bsort(u32 depth, u32 dir, u32 tree) {
-    if (depth == 0 || !is_node(tree)) {
-        return tree;
-    }
-    u32 l = bsort(depth - 1, 0, tree_left(tree));
-    u32 r = bsort(depth - 1, 1, tree_right(tree));
-    return flow(depth, dir, make_node(l, r));
+Tree gen(uint32_t d, uint32_t x) {
+  if (d == 0) {
+    return Leaf(x);
+  } else {
+    Tree xl = gen(d - 1, x * 2 + 1);
+    Tree xr = gen(d - 1, x * 2);
+    return Node(xl, xr);
+  }
 }
 
-// ---------------------------------------------------------------------------
-// Verification: in-order traversal should produce 0, 1, 2, ..., n-1
-// ---------------------------------------------------------------------------
-
-static u32 check_idx;
-static int check_ok;
-
-static void verify(u32 tree) {
-    if (!is_node(tree)) {
-        if (get_val(tree) != check_idx) {
-            check_ok = 0;
-        }
-        check_idx++;
-    } else {
-        verify(tree_left(tree));
-        verify(tree_right(tree));
-    }
+uint64_t sum(Tree t) {
+  if (!is_node(t)) {
+    return get_val(t);
+  } else {
+    return sum(get_l(t)) + sum(get_r(t));
+  }
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-
-static double now(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec + ts.tv_nsec * 1e-9;
+Tree warp_swap(uint32_t c, uint32_t av, uint32_t bv) {
+  if (c == 0) {
+    return Node(Leaf(av), Leaf(bv));
+  } else {
+    return Node(Leaf(bv), Leaf(av));
+  }
 }
 
-int main(int argc, char **argv) {
-    u32 depth   = (argc > 1) ? (u32)atoi(argv[1]) : 20;
-    u64 heap_gb = (argc > 2) ? (u64)atoi(argv[2]) : (depth >= 20 ? 16 : 8);
-    u64 heap_words = (heap_gb << 30) / 4;
+Tree warp(uint32_t d, uint32_t s, Tree a, Tree b) {
+  if (d == 0) {
+    uint32_t av = get_val(a);
+    uint32_t bv = get_val(b);
+    return warp_swap(s ^ (av > bv ? 1 : 0), av, bv);
+  } else {
+    Tree wa = warp(d - 1, s, get_l(a), get_l(b));
+    Tree wb = warp(d - 1, s, get_r(a), get_r(b));
+    return Node(Node(get_l(wa), get_l(wb)), Node(get_r(wa), get_r(wb)));
+  }
+}
 
-    fprintf(stderr, "sort(%u): heap = %llu GB\n",
-            depth, (unsigned long long)heap_gb);
+Tree flow(uint32_t d, uint32_t s, Tree t);
+Tree down(uint32_t d, uint32_t s, Tree t);
 
-    double t0 = now();
+Tree flow(uint32_t d, uint32_t s, Tree t) {
+  if (d == 0) {
+    return t;
+  } else {
+    Tree warped = warp(d - 1, s, get_l(t), get_r(t));
+    return down(d, s, warped);
+  }
+}
 
-    heap = (u32 *)malloc(heap_words * 4);
-    if (!heap) {
-        fprintf(stderr, "malloc failed\n");
-        return 1;
-    }
-    heap_ptr = 0;
+Tree down(uint32_t d, uint32_t s, Tree t) {
+  if (d == 0) {
+    return t;
+  } else if (!is_node(t)) {
+    return t;
+  } else {
+    Tree tl = flow(d - 1, s, get_l(t));
+    Tree tr = flow(d - 1, s, get_r(t));
+    return Node(tl, tr);
+  }
+}
 
-    u32 tree = gen(depth, 0);
-    u32 sorted = bsort(depth, 0, tree);
-
-    check_idx = 0;
-    check_ok = 1;
-    verify(sorted);
-    u32 expected = 1u << depth;
-    double elapsed = now() - t0;
-
-    fprintf(stderr, "sort(%u) %s  heap = %.2f GB  %.3fs\n",
-            depth,
-            (check_ok && check_idx == expected) ? "PASS" : "FAIL",
-            heap_ptr * 4.0 / (1ULL << 30),
-            elapsed);
-
-    free(heap);
+uint32_t depth(Tree t) {
+  if (!is_node(t)) {
     return 0;
+  } else {
+    return 1 + depth(get_l(t));
+  }
+}
+
+Tree sort_tree(Tree t) {
+  uint32_t d = depth(t);
+  return flow(d, 0, t);
+}
+
+int main(void) {
+  size_t heap_elems = (uint64_t)1 << 33;
+  size_t heap_bytes = heap_elems * sizeof(uint64_t);
+  heap = (uint64_t*)mmap(NULL, heap_bytes,
+    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (heap == MAP_FAILED) {
+    fprintf(stderr, "mmap failed\n");
+    return 1;
+  }
+  printf("%" PRIu64 "\n", sum(sort_tree(gen(24, 0))));
+
+  double used_bytes = (double)heap_max * sizeof(uint64_t);
+  const char* unit;
+  double display;
+  if (used_bytes >= (1024.0 * 1024.0 * 1024.0)) {
+    display = used_bytes / (1024.0 * 1024.0 * 1024.0);
+    unit = "GiB";
+  } else if (used_bytes >= (1024.0 * 1024.0)) {
+    display = used_bytes / (1024.0 * 1024.0);
+    unit = "MiB";
+  } else if (used_bytes >= 1024.0) {
+    display = used_bytes / 1024.0;
+    unit = "KiB";
+  } else {
+    display = used_bytes;
+    unit = "bytes";
+  }
+  fprintf(stderr, "heap_used: %" PRIu64 " slots (%" PRIu64 " bytes, %.2f %s)\n",
+    heap_max, heap_max * sizeof(uint64_t), display, unit);
+
+  munmap(heap, heap_bytes);
+  return 0;
 }
