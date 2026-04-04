@@ -16,12 +16,20 @@ function gen(d, x) {
   }
 }
 
-function sum(t) {
-  if (t.tag === "Leaf") {
-    return t.v;
-  } else {
-    return sum(t.l) + sum(t.r);
+function checksum(t) {
+  var idx = 0;
+  var result = 0;
+  function go(t) {
+    if (t.tag === "Leaf") {
+      result = ((result * 31 + t.v) >>> 0);
+      idx++;
+    } else {
+      go(t.l);
+      go(t.r);
+    }
   }
+  go(t);
+  return result;
 }
 
 function warp_swap(c, av, bv) {
@@ -79,7 +87,7 @@ function sort(t) {
 }
 
 function main() {
-  return sum(sort(gen(22, 0)));
+  return checksum(sort(gen(20, 0)));
 }
 
 console.log(main());

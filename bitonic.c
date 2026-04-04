@@ -58,12 +58,19 @@ Tree gen(uint32_t d, uint32_t x) {
   }
 }
 
-uint64_t sum(Tree t) {
+static void checksum_go(Tree t, uint32_t* result) {
   if (!is_node(t)) {
-    return get_val(t);
+    *result = (uint32_t)((uint32_t)(*result * 31) + (uint32_t)get_val(t));
   } else {
-    return sum(get_l(t)) + sum(get_r(t));
+    checksum_go(get_l(t), result);
+    checksum_go(get_r(t), result);
   }
+}
+
+uint64_t checksum(Tree t) {
+  uint32_t result = 0;
+  checksum_go(t, &result);
+  return (uint64_t)result;
 }
 
 Tree warp_swap(uint32_t c, uint32_t av, uint32_t bv) {
@@ -124,7 +131,7 @@ Tree sort_tree(Tree t) {
 }
 
 int main(void) {
-  size_t heap_elems = (uint64_t)1 << 33;
+  size_t heap_elems = (uint64_t)1 << 42;
   size_t heap_bytes = heap_elems * sizeof(uint64_t);
   heap = (uint64_t*)mmap(NULL, heap_bytes,
     PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -132,7 +139,7 @@ int main(void) {
     fprintf(stderr, "mmap failed\n");
     return 1;
   }
-  printf("%" PRIu64 "\n", sum(sort_tree(gen(24, 0))));
+  printf("%" PRIu64 "\n", checksum(sort_tree(gen(20, 0))));
 
   double used_bytes = (double)heap_max * sizeof(uint64_t);
   const char* unit;
@@ -150,8 +157,7 @@ int main(void) {
     display = used_bytes;
     unit = "bytes";
   }
-  fprintf(stderr, "heap_used: %" PRIu64 " slots (%" PRIu64 " bytes, %.2f %s)\n",
-    heap_max, heap_max * sizeof(uint64_t), display, unit);
+  fprintf(stderr, "heap_used: %" PRIu64 " slots (%" PRIu64 " bytes, %.2f %s)\n", heap_max, heap_max * sizeof(uint64_t), display, unit);
 
   munmap(heap, heap_bytes);
   return 0;
