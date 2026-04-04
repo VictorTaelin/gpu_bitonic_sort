@@ -159,6 +159,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "sort(%u): heap = %llu GB\n",
             depth, (unsigned long long)heap_gb);
 
+    double t0 = now();
+
     heap = (u32 *)malloc(heap_words * 4);
     if (!heap) {
         fprintf(stderr, "malloc failed\n");
@@ -167,15 +169,13 @@ int main(int argc, char **argv) {
     heap_ptr = 0;
 
     u32 tree = gen(depth, 0);
-
-    double t0 = now();
     u32 sorted = bsort(depth, 0, tree);
-    double elapsed = now() - t0;
 
     check_idx = 0;
     check_ok = 1;
     verify(sorted);
     u32 expected = 1u << depth;
+    double elapsed = now() - t0;
 
     fprintf(stderr, "sort(%u) %s  heap = %.2f GB  %.3fs\n",
             depth,

@@ -628,13 +628,14 @@ int main(int argc, char **argv) {
     fprintf(stderr, "sort(%u): heap=%uGB dfs_depth=%u max_bag=%u max_frames=%u\n",
             depth, heap_gb, dfs_depth, max_bag, max_frames);
 
-    // Copy DFS depth to device constant memory.
-    CHK(cudaMemcpyToSymbol(g_dfs_depth, &dfs_depth, sizeof(u32)));
+    // --- Timer starts before any CUDA call (context init is real cost) ---
 
-    // Increase stack size for DFS recursion.
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    CHK(cudaMemcpyToSymbol(g_dfs_depth, &dfs_depth, sizeof(u32)));
     CHK(cudaDeviceSetLimit(cudaLimitStackSize, 4096));
 
-    // Query cooperative-launch block count.
     int blocks_per_sm = 0;
     CHK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &blocks_per_sm, eval_kernel, THREADS_PER_BLOCK,
@@ -645,15 +646,9 @@ int main(int argc, char **argv) {
     fprintf(stderr, "SMs=%d blocks/SM=%d blocks=%d threads=%d\n",
             num_sms, blocks_per_sm, num_blocks, num_blocks * THREADS_PER_BLOCK);
 
-    // --- Allocate ---
-
     u32 *dev_heap, *dev_heap_ptr;
     CHK(cudaMalloc(&dev_heap,     heap_words * 4));
     CHK(cudaMalloc(&dev_heap_ptr, sizeof(u32)));
-
-    generate_tree<<<(num_nodes + 255) / 256, 256>>>(dev_heap, depth, num_nodes);
-    CHK(cudaDeviceSynchronize());
-    CHK(cudaMemcpy(dev_heap_ptr, &initial_hp, sizeof(u32), cudaMemcpyHostToDevice));
 
     Task *dev_bag_a, *dev_bag_b;
     CHK(cudaMalloc(&dev_bag_a, (u64)max_bag * sizeof(Task)));
@@ -670,7 +665,9 @@ int main(int argc, char **argv) {
     CHK(cudaMalloc(&dev_frame_ptr, sizeof(u32)));
     CHK(cudaMalloc(&dev_result,    sizeof(u32)));
 
-    // --- Initialize ---
+    generate_tree<<<(num_nodes + 255) / 256, 256>>>(dev_heap, depth, num_nodes);
+    CHK(cudaDeviceSynchronize());
+    CHK(cudaMemcpy(dev_heap_ptr, &initial_hp, sizeof(u32), cudaMemcpyHostToDevice));
 
     Task initial_task;
     initial_task.pack    = PACK_TASK(FN_SORT, depth, 0, 0);
@@ -685,12 +682,6 @@ int main(int argc, char **argv) {
     CHK(cudaMemcpy(dev_frame_ptr, &zero, sizeof(u32), cudaMemcpyHostToDevice));
     CHK(cudaMemcpy(dev_result,    &zero, sizeof(u32), cudaMemcpyHostToDevice));
 
-    // Warmup.
-    generate_tree<<<1, 1>>>(dev_heap, 0, 0);
-    CHK(cudaDeviceSynchronize());
-
-    // --- Launch ---
-
     void *args[] = {
         &dev_bag_a,    &dev_bag_b,
         &dev_count_a,  &dev_count_b,
@@ -699,19 +690,12 @@ int main(int argc, char **argv) {
         &dev_result
     };
 
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-
     CHK(cudaLaunchCooperativeKernel(
         (void *)eval_kernel, num_blocks, THREADS_PER_BLOCK, args,
         MAX_BLOCK_TASKS * sizeof(Task) + 8));
     CHK(cudaDeviceSynchronize());
 
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    double sort_time = (t1.tv_sec - t0.tv_sec) +
-                       (t1.tv_nsec - t0.tv_nsec) * 1e-9;
-
-    // --- Results ---
+    // --- Results + verification (still inside timed section) ---
 
     u32 result_root, final_hp, final_fp;
     CHK(cudaMemcpy(&result_root, dev_result,    sizeof(u32), cudaMemcpyDeviceToHost));
@@ -725,15 +709,12 @@ int main(int argc, char **argv) {
     u32 checksum;
     CHK(cudaMemcpy(&checksum, dev_sum, sizeof(u32), cudaMemcpyDeviceToHost));
 
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double sort_time = (t1.tv_sec - t0.tv_sec) +
+                       (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+
     fprintf(stderr, "sort(%u) = %u  heap=%.2fGB  frames=%u  %.3fs\n",
             depth, checksum, final_hp * 4.0 / (1ULL << 30), final_fp, sort_time);
 
-    // --- Cleanup ---
-
-    cudaFree(dev_heap);      cudaFree(dev_heap_ptr);
-    cudaFree(dev_bag_a);     cudaFree(dev_bag_b);
-    cudaFree(dev_count_a);   cudaFree(dev_count_b);
-    cudaFree(dev_frames);    cudaFree(dev_frame_ptr);
-    cudaFree(dev_result);    cudaFree(dev_sum);
     return 0;
 }
