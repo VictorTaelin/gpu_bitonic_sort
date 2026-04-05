@@ -341,12 +341,14 @@ __global__ void main_kernel(G g) {
 #ifdef DEBUG_MATRIX
     grid.sync();
     if (bid == 0 && tid == 0) {
-      u32 total = 0, mn = 99999, mx = 0;
-      for (int b = 0; b < NB; b++) {
-        u32 c = g.bcnt[b]; total += c;
-        if (c < mn) mn = c; if (c > mx) mx = c;
+      u32 total = 0;
+      for (int b = 0; b < NB; b++) total += g.bcnt[b];
+      printf("  GROW total=%u\n", total);
+      for (int r = 0; r < BS; r++) {
+        for (int b = 0; b < NB; b++)
+          printf("%c", r < (int)g.bcnt[b] ? 'X' : '.');
+        printf("\n");
       }
-      printf("  GROW total=%u  per-block=[%u..%u]\n", total, mn, mx);
     }
     grid.sync();
 #endif
