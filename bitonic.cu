@@ -1,5 +1,5 @@
 // bitonic.cu
-// =========
+// ==========
 //
 // GPU parallel evaluator for recursive functional programs, demonstrated
 // with bitonic sort. Takes pure recursive functions (see bitonic.c) and
