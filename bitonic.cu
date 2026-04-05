@@ -1233,11 +1233,8 @@ int main(int argc, char **argv) {
   fprintf(stderr, "Bitonic sort  depth=%d  elems=%u  (%d blocks × %d threads)\n",
           depth, 1u << depth, NUM_BLOCKS, BLOCK_SIZE);
 
-  // Size heap and continuations based on depth.
-  // N<=20: 8 GB heap, 16M conts (512 MB)  → total ~8.6 GB (fast cudaMalloc)
-  // N>=21: 16 GB heap, 32M conts (1 GB)   → total ~17 GB
-  size_t heap_entries = (depth <= 20) ? (1ull << 30) : (1ull << 31);
-  size_t cont_cap    = (depth <= 20) ? (1ull << 24) : (1ull << 25);
+  size_t heap_entries = 1ull << 31;  // 16 GB
+  size_t cont_cap    = 1ull << 25;   // 1 GB
 
   // Allocate all GPU memory in one call.
   #define ALIGN(x) (((x) + 255) & ~(size_t)255)
