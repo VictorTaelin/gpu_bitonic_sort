@@ -3,118 +3,121 @@
 // ==========================================================================
 //
 // This file implements a general-purpose parallel evaluator for pure
-// functional programs on the GPU, demonstrated with a bitonic sort algorithm.
-// The key idea: we take recursive functions written in a simple functional
-// style (like the C reference in bitonic.c) and "manually compile" them into
-// a task-based runtime that exploits GPU parallelism automatically.
+// recursive functions on the GPU. It takes functions written in a simple
+// functional style (like the C reference in bitonic.c) and "manually
+// compiles" them into a task-based GPU runtime that exploits parallelism.
 //
-// THE ALGORITHM (from bitonic.c, cannot be changed):
+// The runtime is fully generic — it knows nothing about sort, flow, warp,
+// gen, or checksum. All algorithm-specific code lives in a single section
+// marked "COMPILED FUNCTIONS", which a future compiler would generate
+// automatically. Everything else (the scheduler, allocator, resolver) is
+// reusable infrastructure.
+//
+// ==========================================================================
+// THE ORIGINAL ALGORITHM (from bitonic.c — cannot be changed)
+// ==========================================================================
+//
+//   gen(d, x):
+//     if d == 0: return Leaf(x)
+//     l = gen(d-1, x*2+1)   // PARALLEL
+//     r = gen(d-1, x*2)     // PARALLEL
+//     return Node(l, r)
 //
 //   sort(d, s, t):
-//     if d == 0 or t is a leaf: return t
-//     left  = sort(d-1, 0, left_child(t))    // PARALLEL
-//     right = sort(d-1, 1, right_child(t))    // PARALLEL
-//     return flow(d, s, Node(left, right))
+//     if d == 0 or is_leaf(t): return t
+//     l = sort(d-1, 0, left(t))   // PARALLEL
+//     r = sort(d-1, 1, right(t))  // PARALLEL
+//     return flow(d, s, Node(l, r))
 //
 //   flow(d, s, t):
-//     if d == 0 or t is a leaf: return t
-//     warped = warp(d-1, s, left_child(t), right_child(t))
-//     return down(d, s, warped)
+//     if d == 0 or is_leaf(t): return t
+//     w = warp(d-1, s, left(t), right(t))
+//     return down(d, s, w)
 //
 //   down(d, s, t):
-//     if d == 0 or t is a leaf: return t
-//     left  = flow(d-1, s, left_child(t))     // PARALLEL
-//     right = flow(d-1, s, right_child(t))     // PARALLEL
-//     return Node(left, right)
+//     if d == 0 or is_leaf(t): return t
+//     l = flow(d-1, s, left(t))   // PARALLEL
+//     r = flow(d-1, s, right(t))  // PARALLEL
+//     return Node(l, r)
 //
 //   warp(d, s, a, b):
-//     if d == 0: compare-and-swap leaves a, b based on s
-//     left  = warp(d-1, s, left(a), left(b))   // PARALLEL
-//     right = warp(d-1, s, right(a), right(b))  // PARALLEL
-//     return Node(Node(left_l, right_l), Node(left_r, right_r))
+//     if d == 0: compare-and-swap leaves a,b by direction s
+//     l = warp(d-1, s, left(a),  left(b))    // PARALLEL
+//     r = warp(d-1, s, right(a), right(b))   // PARALLEL
+//     return Node(Node(left(l),left(r)), Node(right(l),right(r)))
+//
+//   checksum(t):
+//     if is_leaf(t): return val(t)
+//     return checksum(left(t)) * 31^(leaf_count(right(t))) + checksum(right(t))
 //
 // Lines marked PARALLEL are where two independent recursive calls can run
 // concurrently. This evaluator exploits that parallelism on the GPU.
 //
 // ==========================================================================
-// HOW IT WORKS: THE TASK/CONTINUATION RUNTIME
+// HOW THE COMPILER WORKS
 // ==========================================================================
 //
-// Each recursive function is "compiled" into a task function that, instead of
-// recursing, returns one of three results:
+// Each function with a PARALLEL annotation is compiled into two parts:
 //
-//   VALUE(v)       — the function completed; return value v
-//   SPLIT(t0, t1)  — the function needs two parallel sub-calls; create tasks
-//                     t0 and t1, plus a continuation that fires when both done
-//   CALL(t0)       — the function needs one sub-call; create task t0 and a
-//                     continuation that fires when it returns
+//   par_<name>_0 (the "splitter"):
+//     Checks base cases. If not a base case, allocates a Continuation and
+//     returns SPLIT(child_task_0, child_task_1). The continuation stores
+//     which "join" function to call when both children complete.
 //
-// A Continuation is a suspended function waiting for its children to finish.
-// It stores: which function to resume (fn), how many children are pending
-// (pending count), where to send its own result (return address), and slots
-// for the children's results. When a child produces a VALUE, it writes into
-// the continuation's slot and decrements the pending count. The thread that
-// decrements it to zero "fires" the continuation, executing the resume
-// function, which may itself return VALUE/SPLIT/CALL.
+//   par_<name>_1 (the "joiner" / continuation handler):
+//     Called when both children have produced values. Combines the results
+//     (e.g., Node(left, right)) and returns the final VALUE — or chains
+//     into another function via CALL.
+//
+// Functions without PARALLEL annotations (like flow) that still need a
+// sub-call use CALL instead of SPLIT, creating a 1-child continuation.
+//
+// Each function also has a seq_<name> variant: the original recursive
+// function compiled directly for single-thread execution. During the WORK
+// phase, tasks call seq_* to run the subtree to completion.
 //
 // ==========================================================================
-// HOW IT WORKS: THE SEED/GROW/WORK SCHEDULING
+// HOW THE RUNTIME WORKS: SEED / GROW / WORK
 // ==========================================================================
 //
 // The runtime maintains a "task matrix" of NUM_BLOCKS × BLOCK_SIZE slots.
-// Each column belongs to one GPU block; each row is one thread's task slot.
-// Execution proceeds in three phases that repeat:
+// Execution proceeds in three repeating phases:
 //
-//   SEED  (1 block, NUM_BLOCKS threads)
-//     Starting from a small number of tasks (≤ NUM_BLOCKS), iteratively
-//     execute them. Tasks that SPLIT produce 2 children, doubling the count
-//     each round. After log2(NUM_BLOCKS) rounds, we have NUM_BLOCKS tasks —
-//     one per GPU block. This fills one "row" of the matrix.
+//   SEED  (1 block)
+//     Starting from ≤ NUM_BLOCKS tasks, iteratively split them. Each SPLIT
+//     doubles the count. After ~log2(NUM_BLOCKS) rounds, we have one task
+//     per GPU block.
 //
-//   GROW  (NUM_BLOCKS blocks, BLOCK_SIZE threads each)
-//     Each block takes its task(s) from the flat buffer and iteratively
-//     splits them in shared memory, doubling each round. After log2(BLOCK_SIZE)
-//     rounds, each block has BLOCK_SIZE tasks — filling its full column.
-//     Now the entire matrix is populated.
+//   GROW  (all blocks)
+//     Each block takes its task(s) and splits them in shared memory,
+//     doubling each round until BLOCK_SIZE tasks fill the column.
+//     Now all NUM_BLOCKS × BLOCK_SIZE slots are populated.
 //
-//   WORK  (NUM_BLOCKS blocks, BLOCK_SIZE threads each)
-//     Every thread executes its task *sequentially* (calling the recursive
-//     d_sort, d_flow, etc. functions directly). This is where computation
-//     happens. When a thread finishes and produces a VALUE, it resolves
-//     continuations: writing the value into the parent continuation's slot,
-//     and if that continuation is now complete, executing it. The result
-//     may be a new task (SPLIT/CALL) which gets added to a flat output buffer
-//     for the next round.
+//   WORK  (all blocks)
+//     Every thread executes its task sequentially (calling seq_*). The
+//     resulting VALUE feeds into continuation resolution: the value is
+//     written to the parent continuation's slot, and if the continuation
+//     is now complete, its join function fires. New tasks (from SPLIT/CALL)
+//     are collected for the next round.
 //
-// After WORK, the flat buffer contains the new tasks. The cycle repeats:
-//   - If count ≤ NUM_BLOCKS → SEED first, then GROW, then WORK
-//   - If count > NUM_BLOCKS → skip SEED, just GROW then WORK
-//   - If count == 0 and done flag is set → computation is complete
+// This runs as a single cooperative kernel with grid.sync() between phases.
+// No host synchronization, no global queues, no work stealing.
 //
-// This runs as a single cooperative kernel with grid-wide synchronization
-// between phases, eliminating all host↔device synchronization overhead.
-//
-// The effective sequential cutoff emerges naturally from the matrix size:
-// with NUM_BLOCKS=128 and BLOCK_SIZE=256, SEED uses 7 doublings and GROW
-// uses 8 doublings, so sort(20) bottoms out at sort(5) — each thread
-// sequentially sorts a 32-element subtree.
+// The sequential cutoff emerges naturally: with 128 blocks × 256 threads,
+// SEED uses 7 doublings and GROW uses 8, so sort(20) bottoms out at
+// sort(5) — each thread sorts a 32-element subtree sequentially.
 //
 // ==========================================================================
-// MEMORY MANAGEMENT
+// MEMORY
 // ==========================================================================
 //
-// Trees are stored in a shared heap (a flat array of u64 values). A Node
-// occupies two consecutive heap slots [left_child, right_child] and is
-// represented as a tagged u64 pointing to its first slot.
+// Trees live on a flat heap of u64 values. A Node at index i stores its
+// left child at heap[i] and right child at heap[i+1].
 //
-// The heap is divided into equal-sized slices, one per thread slot
-// (NUM_BLOCKS × BLOCK_SIZE total). Each thread bumps a local pointer within
-// its slice — zero contention, zero atomics, provably the fastest possible
-// allocation scheme for a fixed thread count.
+// The heap is split into equal per-thread slices. Each thread bumps a local
+// pointer — zero contention, zero atomics.
 //
-// Continuations use a separate buffer with a chunked bump allocator: each
-// thread grabs small chunks (CONT_CHUNK entries) from a global atomic
-// counter, then allocates locally within its chunk.
+// Continuations use a separate buffer with a chunked bump allocator.
 //
 // ==========================================================================
 
@@ -130,579 +133,594 @@ typedef unsigned long long u64;
 typedef unsigned int       u32;
 typedef unsigned short     u16;
 
-// --------------------------------------------------------------------------
+// ==========================================================================
 // Configuration
-// --------------------------------------------------------------------------
+// ==========================================================================
 
-#define NUM_BLOCKS  128              // GPU blocks (1 per SM on RTX 4090)
-#define BLOCK_SIZE  256              // Threads per block
-#define TOTAL_SLOTS (NUM_BLOCKS * BLOCK_SIZE)  // 32768 total worker slots
+#define NUM_BLOCKS 128
+#define BLOCK_SIZE 256
+#define NUM_SLOTS  (NUM_BLOCKS * BLOCK_SIZE)
+#define HEAP_SIZE  (2u << 30)
+#define CONT_CAP   (1u << 26)
+#define CONT_CHUNK 2
 
-#define HEAP_SIZE   (2u << 30)       // Heap capacity in u64s (16 GB)
-#define CONT_CAP    (1u << 26)       // Max continuations (64M)
-#define CONT_CHUNK  2                // Cont allocation chunk size (small = less waste)
+// #define DEBUG_MATRIX
 
-// #define DEBUG_MATRIX              // Uncomment to print task matrix each step
-
-// --------------------------------------------------------------------------
+// ==========================================================================
 // Tree Encoding
-// --------------------------------------------------------------------------
+// ==========================================================================
 //
-// A Tree is a u64. Bit 63 is the tag:
-//   - Leaf: bit 63 = 0, bits [31:0] = value
-//   - Node: bit 63 = 1, bits [30:0] = heap index (left at heap[idx], right at heap[idx+1])
+// A Tree is a u64 with bit 63 as the tag:
+//   Leaf: bit 63 = 0, bits [31:0] = value
+//   Node: bit 63 = 1, bits [30:0] = heap index
 
 #define NODE_TAG (1ULL << 63)
 
-__host__ __device__ inline u64  make_leaf(u32 value) { return (u64)value; }
-__host__ __device__ inline u64  make_node(u32 index) { return NODE_TAG | (u64)index; }
-__host__ __device__ inline bool is_node(u64 tree)    { return (tree & NODE_TAG) != 0; }
-__host__ __device__ inline bool is_leaf(u64 tree)    { return !is_node(tree); }
-__host__ __device__ inline u32  leaf_value(u64 tree) { return (u32)(tree & 0xFFFFFFFFu); }
-__host__ __device__ inline u32  node_index(u64 tree) { return (u32)(tree & 0x7FFFFFFFu); }
+__host__ __device__ inline u64  make_leaf(u32 val)  { return (u64)val; }
+__host__ __device__ inline u64  make_node(u32 idx)  { return NODE_TAG | (u64)idx; }
+__host__ __device__ inline bool is_node(u64 t)      { return (t & NODE_TAG) != 0; }
+__host__ __device__ inline bool is_leaf(u64 t)      { return !is_node(t); }
+__host__ __device__ inline u32  get_val(u64 t)      { return (u32)(t & 0xFFFFFFFFu); }
+__host__ __device__ inline u32  get_idx(u64 t)      { return (u32)(t & 0x7FFFFFFFu); }
 
-// --------------------------------------------------------------------------
-// Function IDs — each recursive function and its continuation
-// --------------------------------------------------------------------------
+// ==========================================================================
+// Runtime Data Structures
+// ==========================================================================
 
-enum FnId {
-  FN_SORT       = 0,   // sort(depth, side, tree)
-  FN_FLOW       = 1,   // flow(depth, side, tree)
-  FN_SWAP       = 2,   // warp/swap(side, tree, depth)
-  FN_SORT_CONT  = 3,   // sort continuation: got both sorted halves → call flow
-  FN_FLOW_AFTER = 4,   // flow continuation: got swap result → split into two flows
-  FN_FLOW_JOIN  = 5,   // flow join: got both flow results → make Node
-  FN_SWAP_JOIN  = 6,   // swap join: got both swap results → reassemble
-  FN_GEN        = 7,   // gen(depth, x) — tree generation
-  FN_GEN_JOIN   = 8,   // gen join: got both subtrees → make Node
-  FN_CSUM       = 9,   // checksum(tree, depth)
-  FN_CSUM_JOIN  = 10,  // checksum join: combine left and right checksums
-};
+// Result tags: what a task function returns.
+#define R_VALUE 0
+#define R_SPLIT 1
+#define R_CALL  2
 
-// --------------------------------------------------------------------------
-// Result Tags
-// --------------------------------------------------------------------------
+// Special return address for the root computation.
+#define ROOT_RET 0xFFFFFFFFu
 
-enum ResultTag {
-  RESULT_VALUE = 0,   // Computation complete, here is the value
-  RESULT_SPLIT = 1,   // Need two parallel sub-computations
-  RESULT_CALL  = 2,   // Need one sub-computation (with a continuation)
-};
-
-// Special return address meaning "this is the root computation"
-#define ROOT_RETURN 0xFFFFFFFFu
-
-// --------------------------------------------------------------------------
-// Data Structures
-// --------------------------------------------------------------------------
-
-// A Task represents a function call to be executed.
-//   fn:  which function to call (FnId)
-//   ret: where to write the result (encoded continuation index + slot)
-//   args: up to 3 arguments (interpretation depends on fn)
+// A Task: a deferred function call.
+//   fn:   function ID
+//   ret:  encoded return address (continuation index << 1 | slot)
+//   args: up to 3 u64 arguments
 struct Task {
   u32 fn;
   u32 ret;
   u64 args[3];
 };
 
-// A Continuation is a suspended computation waiting for child results.
-//   pending: number of children still running (atomically decremented)
-//   ret:     where to write *this* continuation's result
-//   fn:      which function to resume when all children are done
-//   a0-a1:   small arguments saved from the original call (e.g., depth, side)
-//   slots:   two slots for child results (filled as children complete)
-struct Continuation {
-  u32 pending;
+// A Cont: a suspended function waiting for 1 or 2 child results.
+//   pend:  number of children still pending (decremented atomically)
+//   ret:   where this cont's result goes
+//   fn:    which join function to call when ready
+//   a0,a1: saved small arguments (e.g. depth, side)
+//   slots: child results written here as they arrive
+struct Cont {
+  u32 pend;
   u32 ret;
   u16 fn;
   u16 a0;
   u16 a1;
-  u16 _padding;
+  u16 _pad;
   u64 slots[2];
 };
 
-// The result of executing a task function.
+// A Result: returned by task/continuation functions.
 struct Result {
-  u32  tag;         // RESULT_VALUE, RESULT_SPLIT, or RESULT_CALL
-  u64  value;       // If VALUE: the result
-  Task child0;      // If SPLIT or CALL: first (or only) child task
-  Task child1;      // If SPLIT: second child task
+  u32  tag;
+  u64  val;
+  Task t0;
+  Task t1;
 };
 
-// All GPU-side state, passed to kernels.
-struct GPUState {
-  u64          *heap;          // Tree node storage [HEAP_SIZE]
-  u32          *heap_pointers; // Per-slot bump pointers [TOTAL_SLOTS]
-  Continuation *continuations; // Continuation buffer [CONT_CAP]
-  u32          *cont_bump;     // Global continuation allocator counter
-  Task         *task_matrix;   // Column-format task storage [TOTAL_SLOTS]
-  Task         *flat_buffer;   // Flat task buffer for inter-phase transfer [TOTAL_SLOTS]
-  u32          *flat_count;    // Number of tasks in flat buffer
-  u32          *block_counts;  // Per-block task count after GROW [NUM_BLOCKS]
-  u32          *done_flag;     // Set to 1 when root computation completes
-  u64          *root_result;   // The final result of the root computation
+// All GPU state.
+struct State {
+  u64  *heap;
+  u32  *heap_ptrs;
+  Cont *conts;
+  u32  *cont_bump;
+  Task *tasks;
+  Task *flat;
+  u32  *flat_cnt;
+  u32  *block_cnt;
+  u32  *done;
+  u64  *result;
 };
 
-// --------------------------------------------------------------------------
-// CUDA Error Checking
-// --------------------------------------------------------------------------
-
-#define CUDA_CHECK(call) do {                                              \
-  cudaError_t err = (call);                                                \
-  if (err != cudaSuccess) {                                                \
-    fprintf(stderr, "CUDA error at %s:%d: %s\n",                          \
-            __FILE__, __LINE__, cudaGetErrorString(err));                   \
-    exit(1);                                                               \
-  }                                                                        \
-} while (0)
-
-// --------------------------------------------------------------------------
+// ==========================================================================
 // Device Helpers
+// ==========================================================================
+
+__host__ __device__ inline u64 pack(u32 lo, u32 hi) {
+  return (u64)lo | ((u64)hi << 32);
+}
+
+__host__ __device__ inline u32 lo(u64 p) { return (u32)p; }
+__host__ __device__ inline u32 hi(u64 p) { return (u32)(p >> 32); }
+
+__device__ inline u32 alloc_node(u64 l, u64 r, u64 *H, u32 &hp) {
+  u32 i = hp;
+  hp += 2;
+  H[i] = l;
+  H[i + 1] = r;
+  return i;
+}
+
+__device__ inline u32 enc_ret(u32 ci, u32 slot) {
+  return (ci << 1) | slot;
+}
+
+__host__ __device__ inline Task make_task(u32 fn, u32 ret, u64 a0, u64 a1 = 0, u64 a2 = 0) {
+  Task t;
+  t.fn = fn;
+  t.ret = ret;
+  t.args[0] = a0;
+  t.args[1] = a1;
+  t.args[2] = a2;
+  return t;
+}
+
+__device__ inline Result make_value(u64 v) {
+  Result r;
+  r.tag = R_VALUE;
+  r.val = v;
+  return r;
+}
+
+__device__ inline Result make_split(Task a, Task b) {
+  Result r;
+  r.tag = R_SPLIT;
+  r.t0 = a;
+  r.t1 = b;
+  return r;
+}
+
+__device__ inline Result make_call(Task a) {
+  Result r;
+  r.tag = R_CALL;
+  r.t0 = a;
+  return r;
+}
+
+__device__ inline void init_cont(Cont *c, u32 pend, u32 ret, u16 fn, u16 a0, u16 a1) {
+  c->pend = pend;
+  c->ret = ret;
+  c->fn = fn;
+  c->a0 = a0;
+  c->a1 = a1;
+  c->_pad = 0;
+  c->slots[0] = 0;
+  c->slots[1] = 0;
+}
+
+__device__ inline u32 alloc_cont(Cont *C, u32 *bump, u32 &lp, u32 &le) {
+  if (lp >= le) {
+    lp = atomicAdd(bump, (u32)CONT_CHUNK);
+    le = lp + CONT_CHUNK;
+  }
+  return lp++;
+}
+
+inline void cuda_check(cudaError_t err, const char *file, int line) {
+  if (err != cudaSuccess) {
+    fprintf(stderr, "CUDA error at %s:%d: %s\n", file, line, cudaGetErrorString(err));
+    exit(1);
+  }
+}
+#define CHK(x) cuda_check((x), __FILE__, __LINE__)
+
+// ==========================================================================
+// ==========================================================================
+//
+//    ██████  ██████  ███    ███ ██████  ██ ██      ███████ ██████
+//   ██      ██    ██ ████  ████ ██   ██ ██ ██      ██      ██   ██
+//   ██      ██    ██ ██ ████ ██ ██████  ██ ██      █████   ██   ██
+//   ██      ██    ██ ██  ██  ██ ██      ██ ██      ██      ██   ██
+//    ██████  ██████  ██      ██ ██      ██ ███████ ███████ ██████
+//
+//   ███████ ██    ██ ███    ██  ██████ ████████ ██  ██████  ███    ██ ███████
+//   ██      ██    ██ ████   ██ ██         ██    ██ ██    ██ ████   ██ ██
+//   █████   ██    ██ ██ ██  ██ ██         ██    ██ ██    ██ ██ ██  ██ ███████
+//   ██      ██    ██ ██  ██ ██ ██         ██    ██ ██    ██ ██  ██ ██      ██
+//   ██       ██████  ██   ████  ██████    ██    ██  ██████  ██   ████ ███████
+//
+// ==========================================================================
+// ==========================================================================
+//
+// This section contains ALL algorithm-specific code. Everything above and
+// below is generic runtime infrastructure that works with ANY set of
+// recursive functions. A compiler would generate this section automatically.
+//
+// For each original function with a PARALLEL annotation, we produce:
+//   seq_<name>    — direct recursive implementation (for WORK phase)
+//   par_<name>_0  — splitter: returns SPLIT/CALL/VALUE (for SEED/GROW)
+//   par_<name>_1  — joiner: continuation handler (for WORK resolution)
+//
+// Function IDs must be consecutive integers starting at 0.
+// ==========================================================================
+
+// -- Function IDs --
+
+#define FN_GEN      0
+#define FN_GEN_J    1
+#define FN_SORT     2
+#define FN_SORT_C   3
+#define FN_FLOW     4
+#define FN_FLOW_A   5
+#define FN_FLOW_J   6
+#define FN_SWAP     7
+#define FN_SWAP_J   8
+#define FN_CSUM     9
+#define FN_CSUM_J   10
+
+// --------------------------------------------------------------------------
+// gen(d, x)
+//   if d == 0: Leaf(x)
+//   else: Node(gen(d-1, x*2+1), gen(d-1, x*2))   // PARALLEL
 // --------------------------------------------------------------------------
 
-// Pack two u32 values into a single u64 argument.
-// Used to pass (depth, side) or (depth, x) as one argument.
-__host__ __device__ inline u64 pack(u32 low, u32 high) {
-  return (u64)low | ((u64)high << 32);
+__device__ u64 seq_gen(u32 d, u32 x, u64 *H, u32 &hp) {
+  if (d == 0) {
+    return make_leaf(x);
+  }
+  u64 l = seq_gen(d - 1, x * 2 + 1, H, hp);
+  u64 r = seq_gen(d - 1, x * 2, H, hp);
+  return make_node(alloc_node(l, r, H, hp));
 }
 
-__host__ __device__ inline u32 unpack_low(u64 packed) {
-  return (u32)packed;
+__device__ Result par_gen_0(u32 ret, u64 *args, u64 *H, u32 &hp, Cont *C, u32 ci) {
+  u32 d = lo(args[0]);
+  u32 x = hi(args[0]);
+  if (d == 0) {
+    return make_value(make_leaf(x));
+  }
+  init_cont(&C[ci], 2, ret, FN_GEN_J, 0, 0);
+  Task t0 = make_task(FN_GEN, enc_ret(ci, 0), pack(d - 1, x * 2 + 1));
+  Task t1 = make_task(FN_GEN, enc_ret(ci, 1), pack(d - 1, x * 2));
+  return make_split(t0, t1);
 }
 
-__host__ __device__ inline u32 unpack_high(u64 packed) {
-  return (u32)(packed >> 32);
-}
-
-// Allocate a 2-slot tree node on the heap. Returns the heap index.
-__device__ inline u32 alloc_node(u64 left, u64 right, u64 *heap, u32 &heap_ptr) {
-  u32 index = heap_ptr;
-  heap_ptr += 2;
-  heap[index]     = left;
-  heap[index + 1] = right;
-  return index;
-}
-
-// Encode a continuation index + slot number into a return address.
-// Slot is 0 or 1 (which of the continuation's two slots to fill).
-__device__ inline u32 encode_return(u32 cont_index, u32 slot) {
-  return (cont_index << 1) | slot;
-}
-
-// Construct a Task.
-__host__ __device__ inline Task make_task(u32 fn, u32 ret, u64 arg0, u64 arg1 = 0, u64 arg2 = 0) {
-  Task task;
-  task.fn     = fn;
-  task.ret    = ret;
-  task.args[0] = arg0;
-  task.args[1] = arg1;
-  task.args[2] = arg2;
-  return task;
-}
-
-// Construct Result variants.
-__device__ inline Result make_value(u64 value) {
-  Result result;
-  result.tag   = RESULT_VALUE;
-  result.value = value;
-  return result;
-}
-
-__device__ inline Result make_split(Task child0, Task child1) {
-  Result result;
-  result.tag    = RESULT_SPLIT;
-  result.child0 = child0;
-  result.child1 = child1;
-  return result;
-}
-
-__device__ inline Result make_call(Task child) {
-  Result result;
-  result.tag    = RESULT_CALL;
-  result.child0 = child;
-  return result;
+__device__ Result par_gen_1(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &lp, u32 &le) {
+  return make_value(make_node(alloc_node(co->slots[0], co->slots[1], H, hp)));
 }
 
 // --------------------------------------------------------------------------
-// Initialize a continuation.
+// sort(d, s, t)
+//   if d == 0 or is_leaf(t): return t
+//   l = sort(d-1, 0, left(t))    // PARALLEL
+//   r = sort(d-1, 1, right(t))   // PARALLEL
+//   return flow(d, s, Node(l, r))
 // --------------------------------------------------------------------------
 
-__device__ inline void init_continuation(
-    Continuation *cont,
-    u32 pending,
-    u32 ret,
-    u16 fn,
-    u16 a0,
-    u16 a1) {
-  cont->pending  = pending;
-  cont->ret      = ret;
-  cont->fn       = fn;
-  cont->a0       = a0;
-  cont->a1       = a1;
-  cont->_padding = 0;
-  cont->slots[0] = 0;
-  cont->slots[1] = 0;
-}
+__device__ u64 seq_flow(u32 d, u32 s, u64 t, u64 *H, u32 &hp);
 
-// ==========================================================================
-// Sequential Device Functions
-// ==========================================================================
-//
-// These are direct translations of the recursive algorithms from bitonic.c.
-// They execute entirely within a single thread — no task spawning. Used
-// during the WORK phase when the task matrix is fully populated and each
-// thread runs its assigned subtask to completion.
-//
-// Naming convention: seq_* corresponds to the original C function.
-// ==========================================================================
-
-// seq_gen: generate a binary tree with leaves labeled by position.
-//   gen(d, x) = Leaf(x)               if d == 0
-//   gen(d, x) = Node(gen(d-1, 2x+1),  gen(d-1, 2x))
-__device__ u64 seq_gen(u32 depth, u32 x, u64 *heap, u32 &heap_ptr) {
-  if (depth == 0) return make_leaf(x);
-  u64 left  = seq_gen(depth - 1, x * 2 + 1, heap, heap_ptr);
-  u64 right = seq_gen(depth - 1, x * 2,     heap, heap_ptr);
-  return make_node(alloc_node(left, right, heap, heap_ptr));
-}
-
-// seq_pow31: compute 31^n mod 2^32 (used by checksum).
-__device__ u32 seq_pow31(u32 n) {
-  u32 result = 1;
-  for (u32 i = 0; i < n; i++) result *= 31u;
-  return result;
-}
-
-// seq_checksum: parallel-friendly tree checksum.
-//   The original checksum is a left-to-right fold: result = result*31 + val.
-//   For a balanced tree, we can split it: if left subtree has n leaves,
-//   then combined = left_checksum * 31^n + right_checksum.
-__device__ u64 seq_checksum(u64 tree, u32 depth, u64 *heap) {
-  if (depth == 0) return (u64)leaf_value(tree);
-  u32 left_sum  = (u32)seq_checksum(heap[node_index(tree)],     depth - 1, heap);
-  u32 right_sum = (u32)seq_checksum(heap[node_index(tree) + 1], depth - 1, heap);
-  u32 leaves_in_right = 1u << (depth - 1);
-  return (u64)(left_sum * seq_pow31(leaves_in_right) + right_sum);
-}
-
-// seq_warp: the "warp" operation — compare-and-swap across two subtrees.
-//   At depth 0, compares two leaf values and swaps based on direction s.
-//   At depth > 0, recursively warps corresponding children and reassembles.
-__device__ u64 seq_warp(u32 depth, u32 side, u64 a, u64 b, u64 *heap, u32 &heap_ptr) {
-  if (depth == 0) {
-    u32 val_a = leaf_value(a);
-    u32 val_b = leaf_value(b);
-    u32 should_swap = side ^ (val_a > val_b ? 1u : 0u);
-    if (should_swap == 0)
-      return make_node(alloc_node(make_leaf(val_a), make_leaf(val_b), heap, heap_ptr));
-    else
-      return make_node(alloc_node(make_leaf(val_b), make_leaf(val_a), heap, heap_ptr));
+__device__ u64 seq_sort(u32 d, u32 s, u64 t, u64 *H, u32 &hp) {
+  if (d == 0 || is_leaf(t)) {
+    return t;
   }
-  u64 wa = seq_warp(depth - 1, side,
-                    heap[node_index(a)],     heap[node_index(b)],     heap, heap_ptr);
-  u64 wb = seq_warp(depth - 1, side,
-                    heap[node_index(a) + 1], heap[node_index(b) + 1], heap, heap_ptr);
-  u32 left_idx  = alloc_node(heap[node_index(wa)],     heap[node_index(wb)],     heap, heap_ptr);
-  u32 right_idx = alloc_node(heap[node_index(wa) + 1], heap[node_index(wb) + 1], heap, heap_ptr);
-  return make_node(alloc_node(make_node(left_idx), make_node(right_idx), heap, heap_ptr));
+  u64 l = seq_sort(d - 1, 0, H[get_idx(t)], H, hp);
+  u64 r = seq_sort(d - 1, 1, H[get_idx(t) + 1], H, hp);
+  u64 node = make_node(alloc_node(l, r, H, hp));
+  return seq_flow(d, s, node, H, hp);
 }
 
-// seq_flow and seq_down: the "flow" phase of bitonic sort.
-//   flow warps the two halves, then recursively flows each sub-half.
-__device__ u64 seq_flow(u32 depth, u32 side, u64 tree, u64 *heap, u32 &heap_ptr);
-
-__device__ u64 seq_down(u32 depth, u32 side, u64 tree, u64 *heap, u32 &heap_ptr) {
-  if (depth == 0 || is_leaf(tree)) return tree;
-  u64 left  = seq_flow(depth - 1, side, heap[node_index(tree)],     heap, heap_ptr);
-  u64 right = seq_flow(depth - 1, side, heap[node_index(tree) + 1], heap, heap_ptr);
-  return make_node(alloc_node(left, right, heap, heap_ptr));
-}
-
-__device__ u64 seq_flow(u32 depth, u32 side, u64 tree, u64 *heap, u32 &heap_ptr) {
-  if (depth == 0 || is_leaf(tree)) return tree;
-  u64 warped = seq_warp(depth - 1, side,
-                        heap[node_index(tree)], heap[node_index(tree) + 1],
-                        heap, heap_ptr);
-  return seq_down(depth, side, warped, heap, heap_ptr);
-}
-
-// seq_sort: the full bitonic sort — recursively sort halves, then merge.
-__device__ u64 seq_sort(u32 depth, u32 side, u64 tree, u64 *heap, u32 &heap_ptr) {
-  if (depth == 0 || is_leaf(tree)) return tree;
-  u64 sorted_left  = seq_sort(depth - 1, 0, heap[node_index(tree)],     heap, heap_ptr);
-  u64 sorted_right = seq_sort(depth - 1, 1, heap[node_index(tree) + 1], heap, heap_ptr);
-  u64 merged = make_node(alloc_node(sorted_left, sorted_right, heap, heap_ptr));
-  return seq_flow(depth, side, merged, heap, heap_ptr);
-}
-
-// ==========================================================================
-// Task Execution (SEED/GROW phases)
-// ==========================================================================
-//
-// During SEED and GROW, tasks are not executed to completion. Instead, each
-// task function inspects its arguments and returns:
-//   - VALUE if it's a base case (leaf, depth=0)
-//   - SPLIT if it has two parallel children (allocates a continuation)
-//   - CALL  if it has one child with a continuation
-//
-// The SEED/GROW loop collects the children and iterates, doubling the task
-// count each round until the matrix is full.
-// ==========================================================================
-
-__device__ Result execute_task_split(
-    Task         &task,
-    u64          *heap,
-    u32          &heap_ptr,
-    Continuation *conts,
-    u32           cont_index) {
-
-  u32 fn  = task.fn;
-  u32 ret = task.ret;
-
-  // -- sort(depth, side, tree) --
-  if (fn == FN_SORT) {
-    u32 depth = unpack_low(task.args[0]);
-    u32 side  = unpack_high(task.args[0]);
-    u64 tree  = task.args[1];
-    if (depth == 0 || is_leaf(tree)) return make_value(tree);
-    u64 left  = heap[node_index(tree)];
-    u64 right = heap[node_index(tree) + 1];
-    init_continuation(&conts[cont_index], 2, ret, FN_SORT_CONT, (u16)depth, (u16)side);
-    return make_split(
-      make_task(FN_SORT, encode_return(cont_index, 0), pack(depth - 1, 0), left),
-      make_task(FN_SORT, encode_return(cont_index, 1), pack(depth - 1, 1), right));
+__device__ Result par_sort_0(u32 ret, u64 *args, u64 *H, u32 &hp, Cont *C, u32 ci) {
+  u32 d = lo(args[0]);
+  u32 s = hi(args[0]);
+  u64 t = args[1];
+  if (d == 0 || is_leaf(t)) {
+    return make_value(t);
   }
+  u64 l = H[get_idx(t)];
+  u64 r = H[get_idx(t) + 1];
+  init_cont(&C[ci], 2, ret, FN_SORT_C, (u16)d, (u16)s);
+  Task t0 = make_task(FN_SORT, enc_ret(ci, 0), pack(d - 1, 0), l);
+  Task t1 = make_task(FN_SORT, enc_ret(ci, 1), pack(d - 1, 1), r);
+  return make_split(t0, t1);
+}
 
-  // -- swap/warp(side, tree, depth) --
-  if (fn == FN_SWAP) {
-    u32 side  = unpack_low(task.args[0]);
-    u32 depth = unpack_high(task.args[0]);
-    u64 tree  = task.args[1];
-    if (is_leaf(tree)) return make_value(tree);
-    u64 left  = heap[node_index(tree)];
-    u64 right = heap[node_index(tree) + 1];
-    // Base case: two leaves — compare and swap directly
-    if (is_leaf(left) && is_leaf(right)) {
-      u32 val_a = leaf_value(left);
-      u32 val_b = leaf_value(right);
-      u32 should_swap = side ^ (val_a > val_b ? 1u : 0u);
-      u32 idx;
-      if (should_swap == 0)
-        idx = alloc_node(make_leaf(val_a), make_leaf(val_b), heap, heap_ptr);
-      else
-        idx = alloc_node(make_leaf(val_b), make_leaf(val_a), heap, heap_ptr);
-      return make_value(make_node(idx));
+// sort_cont: both halves sorted → Node(l,r) → flow(d, s, node)
+__device__ Result par_sort_1(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &lp, u32 &le) {
+  u32 d = co->a0;
+  u32 s = co->a1;
+  u64 t = make_node(alloc_node(co->slots[0], co->slots[1], H, hp));
+  if (d == 0 || is_leaf(t)) {
+    return make_value(t);
+  }
+  // flow starts with warp, so: CALL swap, then flow_after handles the rest
+  u32 ci = alloc_cont(C, cb, lp, le);
+  init_cont(&C[ci], 1, co->ret, FN_FLOW_A, (u16)d, (u16)s);
+  Task swap = make_task(FN_SWAP, enc_ret(ci, 0), pack(s, d - 1), t);
+  return make_call(swap);
+}
+
+// --------------------------------------------------------------------------
+// flow(d, s, t)
+//   if d == 0 or is_leaf(t): return t
+//   w = warp(d-1, s, left(t), right(t))
+//   return down(d, s, w)
+//
+// flow has no PARALLEL of its own — it just calls warp then down.
+// But down has a PARALLEL, so flow is compiled as:
+//   par_flow_0: CALL warp, set up flow_after continuation
+//   par_flow_after (flow_a): got warp result → SPLIT into two flows (=down)
+//   par_flow_join (flow_j): got both flow results → Node(l, r)
+// --------------------------------------------------------------------------
+
+__device__ u64 seq_warp(u32 d, u32 s, u64 a, u64 b, u64 *H, u32 &hp);
+
+__device__ u64 seq_down(u32 d, u32 s, u64 t, u64 *H, u32 &hp) {
+  if (d == 0 || is_leaf(t)) {
+    return t;
+  }
+  u64 l = seq_flow(d - 1, s, H[get_idx(t)], H, hp);
+  u64 r = seq_flow(d - 1, s, H[get_idx(t) + 1], H, hp);
+  return make_node(alloc_node(l, r, H, hp));
+}
+
+__device__ u64 seq_flow(u32 d, u32 s, u64 t, u64 *H, u32 &hp) {
+  if (d == 0 || is_leaf(t)) {
+    return t;
+  }
+  u64 w = seq_warp(d - 1, s, H[get_idx(t)], H[get_idx(t) + 1], H, hp);
+  return seq_down(d, s, w, H, hp);
+}
+
+__device__ Result par_flow_0(u32 ret, u64 *args, u64 *H, u32 &hp, Cont *C, u32 ci) {
+  u32 d = lo(args[0]);
+  u32 s = hi(args[0]);
+  u64 t = args[1];
+  if (d == 0 || is_leaf(t)) {
+    return make_value(t);
+  }
+  init_cont(&C[ci], 1, ret, FN_FLOW_A, (u16)d, (u16)s);
+  Task swap = make_task(FN_SWAP, enc_ret(ci, 0), pack(s, d - 1), t);
+  return make_call(swap);
+}
+
+// flow_after: warp done → split into two sub-flows (= down's PARALLEL)
+__device__ Result par_flow_after(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &lp, u32 &le) {
+  u32 d = co->a0;
+  u32 s = co->a1;
+  u64 t = co->slots[0];
+  if (is_leaf(t)) {
+    return make_value(t);
+  }
+  u64 l = H[get_idx(t)];
+  u64 r = H[get_idx(t) + 1];
+  u32 ci = alloc_cont(C, cb, lp, le);
+  init_cont(&C[ci], 2, co->ret, FN_FLOW_J, 0, 0);
+  Task t0 = make_task(FN_FLOW, enc_ret(ci, 0), pack(d - 1, s), l);
+  Task t1 = make_task(FN_FLOW, enc_ret(ci, 1), pack(d - 1, s), r);
+  return make_split(t0, t1);
+}
+
+// flow_join: both sub-flows done → Node(l, r)
+__device__ Result par_flow_join(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &lp, u32 &le) {
+  return make_value(make_node(alloc_node(co->slots[0], co->slots[1], H, hp)));
+}
+
+// --------------------------------------------------------------------------
+// warp(d, s, a, b)  — called "swap" in the task system
+//   if d == 0: compare-and-swap leaves
+//   l = warp(d-1, s, left(a),  left(b))     // PARALLEL
+//   r = warp(d-1, s, right(a), right(b))    // PARALLEL
+//   return Node(Node(left(l),left(r)), Node(right(l),right(r)))
+// --------------------------------------------------------------------------
+
+__device__ u64 seq_warp(u32 d, u32 s, u64 a, u64 b, u64 *H, u32 &hp) {
+  if (d == 0) {
+    u32 va = get_val(a);
+    u32 vb = get_val(b);
+    u32 swap = s ^ (va > vb ? 1u : 0u);
+    if (swap == 0) {
+      return make_node(alloc_node(make_leaf(va), make_leaf(vb), H, hp));
+    } else {
+      return make_node(alloc_node(make_leaf(vb), make_leaf(va), H, hp));
     }
-    // Recursive case: rearrange children and split
-    u32 pair0 = alloc_node(heap[node_index(left)],     heap[node_index(right)],     heap, heap_ptr);
-    u32 pair1 = alloc_node(heap[node_index(left) + 1], heap[node_index(right) + 1], heap, heap_ptr);
-    init_continuation(&conts[cont_index], 2, ret, FN_SWAP_JOIN, 0, 0);
-    return make_split(
-      make_task(FN_SWAP, encode_return(cont_index, 0), pack(side, depth - 1), make_node(pair0)),
-      make_task(FN_SWAP, encode_return(cont_index, 1), pack(side, depth - 1), make_node(pair1)));
   }
+  u64 wa = seq_warp(d - 1, s, H[get_idx(a)], H[get_idx(b)], H, hp);
+  u64 wb = seq_warp(d - 1, s, H[get_idx(a) + 1], H[get_idx(b) + 1], H, hp);
+  u32 li = alloc_node(H[get_idx(wa)], H[get_idx(wb)], H, hp);
+  u32 ri = alloc_node(H[get_idx(wa) + 1], H[get_idx(wb) + 1], H, hp);
+  return make_node(alloc_node(make_node(li), make_node(ri), H, hp));
+}
 
-  // -- flow(depth, side, tree) --
-  if (fn == FN_FLOW) {
-    u32 depth = unpack_low(task.args[0]);
-    u32 side  = unpack_high(task.args[0]);
-    u64 tree  = task.args[1];
-    if (depth == 0 || is_leaf(tree)) return make_value(tree);
-    // Flow = warp then split into two sub-flows. But warp must happen first,
-    // so we CALL warp and set up a continuation to handle the split afterward.
-    init_continuation(&conts[cont_index], 1, ret, FN_FLOW_AFTER, (u16)depth, (u16)side);
-    return make_call(
-      make_task(FN_SWAP, encode_return(cont_index, 0), pack(side, depth - 1), tree));
+__device__ Result par_swap_0(u32 ret, u64 *args, u64 *H, u32 &hp, Cont *C, u32 ci) {
+  u32 s = lo(args[0]);
+  u32 d = hi(args[0]);
+  u64 t = args[1];
+  if (is_leaf(t)) {
+    return make_value(t);
   }
-
-  // -- gen(depth, x) --
-  if (fn == FN_GEN) {
-    u32 depth = unpack_low(task.args[0]);
-    u32 x     = unpack_high(task.args[0]);
-    if (depth == 0) return make_value(make_leaf(x));
-    init_continuation(&conts[cont_index], 2, ret, FN_GEN_JOIN, 0, 0);
-    return make_split(
-      make_task(FN_GEN, encode_return(cont_index, 0), pack(depth - 1, x * 2 + 1)),
-      make_task(FN_GEN, encode_return(cont_index, 1), pack(depth - 1, x * 2)));
+  u64 l = H[get_idx(t)];
+  u64 r = H[get_idx(t) + 1];
+  // Leaf-leaf base case: direct compare-and-swap
+  if (is_leaf(l) && is_leaf(r)) {
+    u32 va = get_val(l);
+    u32 vb = get_val(r);
+    u32 swap = s ^ (va > vb ? 1u : 0u);
+    if (swap == 0) {
+      return make_value(make_node(alloc_node(make_leaf(va), make_leaf(vb), H, hp)));
+    } else {
+      return make_value(make_node(alloc_node(make_leaf(vb), make_leaf(va), H, hp)));
+    }
   }
+  // Recursive case: pair up children and split
+  u32 p0 = alloc_node(H[get_idx(l)], H[get_idx(r)], H, hp);
+  u32 p1 = alloc_node(H[get_idx(l) + 1], H[get_idx(r) + 1], H, hp);
+  init_cont(&C[ci], 2, ret, FN_SWAP_J, 0, 0);
+  Task t0 = make_task(FN_SWAP, enc_ret(ci, 0), pack(s, d - 1), make_node(p0));
+  Task t1 = make_task(FN_SWAP, enc_ret(ci, 1), pack(s, d - 1), make_node(p1));
+  return make_split(t0, t1);
+}
 
-  // -- checksum(tree, depth) --
-  if (fn == FN_CSUM) {
-    u32 depth = unpack_low(task.args[0]);
-    u64 tree  = task.args[1];
-    if (depth == 0) return make_value((u64)leaf_value(tree));
-    init_continuation(&conts[cont_index], 2, ret, FN_CSUM_JOIN, (u16)depth, 0);
-    return make_split(
-      make_task(FN_CSUM, encode_return(cont_index, 0), pack(depth - 1, 0), heap[node_index(tree)]),
-      make_task(FN_CSUM, encode_return(cont_index, 1), pack(depth - 1, 0), heap[node_index(tree) + 1]));
+// swap_join: both halves swapped → reassemble warp structure
+__device__ Result par_swap_1(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &lp, u32 &le) {
+  u64 r0 = co->slots[0];
+  u64 r1 = co->slots[1];
+  u32 li = alloc_node(H[get_idx(r0)], H[get_idx(r1)], H, hp);
+  u32 ri = alloc_node(H[get_idx(r0) + 1], H[get_idx(r1) + 1], H, hp);
+  return make_value(make_node(alloc_node(make_node(li), make_node(ri), H, hp)));
+}
+
+// --------------------------------------------------------------------------
+// checksum(t, d)
+//   if d == 0: return get_val(t)
+//   l = checksum(left(t), d-1)     // PARALLEL
+//   r = checksum(right(t), d-1)    // PARALLEL
+//   return l * 31^(2^(d-1)) + r
+// --------------------------------------------------------------------------
+
+__device__ u32 pow31(u32 n) {
+  u32 r = 1;
+  for (u32 i = 0; i < n; i++) {
+    r *= 31u;
   }
+  return r;
+}
 
-  return make_value(0);
+__device__ u64 seq_csum(u64 t, u32 d, u64 *H) {
+  if (d == 0) {
+    return (u64)get_val(t);
+  }
+  u32 l = (u32)seq_csum(H[get_idx(t)], d - 1, H);
+  u32 r = (u32)seq_csum(H[get_idx(t) + 1], d - 1, H);
+  return (u64)(l * pow31(1u << (d - 1)) + r);
+}
+
+__device__ Result par_csum_0(u32 ret, u64 *args, u64 *H, u32 &hp, Cont *C, u32 ci) {
+  u32 d = lo(args[0]);
+  u64 t = args[1];
+  if (d == 0) {
+    return make_value((u64)get_val(t));
+  }
+  init_cont(&C[ci], 2, ret, FN_CSUM_J, (u16)d, 0);
+  Task t0 = make_task(FN_CSUM, enc_ret(ci, 0), pack(d - 1, 0), H[get_idx(t)]);
+  Task t1 = make_task(FN_CSUM, enc_ret(ci, 1), pack(d - 1, 0), H[get_idx(t) + 1]);
+  return make_split(t0, t1);
+}
+
+__device__ Result par_csum_1(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &lp, u32 &le) {
+  u32 d = co->a0;
+  u32 l = (u32)co->slots[0];
+  u32 r = (u32)co->slots[1];
+  return make_value((u64)(l * pow31(1u << (d - 1)) + r));
+}
+
+// --------------------------------------------------------------------------
+// Dispatch tables: the ONLY place the runtime touches function IDs.
+// --------------------------------------------------------------------------
+
+// Called during SEED/GROW to split a task.
+__device__ Result dispatch_split(Task &task, u64 *H, u32 &hp, Cont *C, u32 ci) {
+  switch (task.fn) {
+    case FN_GEN:  return par_gen_0(task.ret, task.args, H, hp, C, ci);
+    case FN_SORT: return par_sort_0(task.ret, task.args, H, hp, C, ci);
+    case FN_FLOW: return par_flow_0(task.ret, task.args, H, hp, C, ci);
+    case FN_SWAP: return par_swap_0(task.ret, task.args, H, hp, C, ci);
+    case FN_CSUM: return par_csum_0(task.ret, task.args, H, hp, C, ci);
+    default:      return make_value(0);
+  }
+}
+
+// Called during WORK to fire a completed continuation.
+__device__ Result dispatch_cont(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &lp, u32 &le) {
+  switch (co->fn) {
+    case FN_GEN_J:  return par_gen_1(co, H, hp, C, cb, lp, le);
+    case FN_SORT_C: return par_sort_1(co, H, hp, C, cb, lp, le);
+    case FN_FLOW_A: return par_flow_after(co, H, hp, C, cb, lp, le);
+    case FN_FLOW_J: return par_flow_join(co, H, hp, C, cb, lp, le);
+    case FN_SWAP_J: return par_swap_1(co, H, hp, C, cb, lp, le);
+    case FN_CSUM_J: return par_csum_1(co, H, hp, C, cb, lp, le);
+    default:        return make_value(0);
+  }
+}
+
+// Called during WORK to execute a task sequentially.
+__device__ u64 dispatch_seq(Task &task, u64 *H, u32 &hp) {
+  switch (task.fn) {
+    case FN_GEN: {
+      u32 d = lo(task.args[0]);
+      u32 x = hi(task.args[0]);
+      return seq_gen(d, x, H, hp);
+    }
+    case FN_SORT: {
+      u32 d = lo(task.args[0]);
+      u32 s = hi(task.args[0]);
+      return seq_sort(d, s, task.args[1], H, hp);
+    }
+    case FN_FLOW: {
+      u32 d = lo(task.args[0]);
+      u32 s = hi(task.args[0]);
+      return seq_flow(d, s, task.args[1], H, hp);
+    }
+    case FN_SWAP: {
+      u32 s = lo(task.args[0]);
+      u32 d = hi(task.args[0]);
+      u64 t = task.args[1];
+      return seq_warp(d, s, H[get_idx(t)], H[get_idx(t) + 1], H, hp);
+    }
+    case FN_CSUM: {
+      u32 d = lo(task.args[0]);
+      return seq_csum(task.args[1], d, H);
+    }
+    default:
+      return 0;
+  }
 }
 
 // ==========================================================================
-// Continuation Execution (WORK phase)
 // ==========================================================================
 //
-// When a continuation's pending count reaches zero (both children done),
-// it fires: the continuation's resume function runs with the saved arguments
-// and the children's results. This may produce VALUE (propagates up),
-// SPLIT (new tasks), or CALL (new task + continuation).
+//   END OF COMPILED FUNCTIONS — everything below is generic runtime.
+//
 // ==========================================================================
-
-__device__ Result execute_continuation(
-    Continuation *cont,
-    u64          *heap,
-    u32          &heap_ptr,
-    Continuation *all_conts,
-    u32          &cont_local_ptr,
-    u32          &cont_local_end,
-    u32          *cont_bump) {
-
-  u16 fn = cont->fn;
-
-  // -- sort_cont: got sorted left and right → build Node, start flow --
-  if (fn == FN_SORT_CONT) {
-    u32 depth = cont->a0;
-    u32 side  = cont->a1;
-    u64 tree = make_node(alloc_node(cont->slots[0], cont->slots[1], heap, heap_ptr));
-    if (depth == 0 || is_leaf(tree)) return make_value(tree);
-    // Allocate a continuation for flow_after_swap
-    if (cont_local_ptr >= cont_local_end) {
-      cont_local_ptr = atomicAdd(cont_bump, (u32)CONT_CHUNK);
-      cont_local_end = cont_local_ptr + CONT_CHUNK;
-    }
-    u32 ci = cont_local_ptr++;
-    init_continuation(&all_conts[ci], 1, cont->ret, FN_FLOW_AFTER, (u16)depth, (u16)side);
-    return make_call(
-      make_task(FN_SWAP, encode_return(ci, 0), pack(side, depth - 1), tree));
-  }
-
-  // -- flow_after: got warp result → split into left and right flow --
-  if (fn == FN_FLOW_AFTER) {
-    u32 depth = cont->a0;
-    u32 side  = cont->a1;
-    u64 tree  = cont->slots[0];
-    if (is_leaf(tree)) return make_value(tree);
-    u64 left  = heap[node_index(tree)];
-    u64 right = heap[node_index(tree) + 1];
-    if (cont_local_ptr >= cont_local_end) {
-      cont_local_ptr = atomicAdd(cont_bump, (u32)CONT_CHUNK);
-      cont_local_end = cont_local_ptr + CONT_CHUNK;
-    }
-    u32 ci = cont_local_ptr++;
-    init_continuation(&all_conts[ci], 2, cont->ret, FN_FLOW_JOIN, 0, 0);
-    return make_split(
-      make_task(FN_FLOW, encode_return(ci, 0), pack(depth - 1, side), left),
-      make_task(FN_FLOW, encode_return(ci, 1), pack(depth - 1, side), right));
-  }
-
-  // -- flow_join: got both flowed halves → combine into Node --
-  if (fn == FN_FLOW_JOIN) {
-    return make_value(make_node(alloc_node(cont->slots[0], cont->slots[1], heap, heap_ptr)));
-  }
-
-  // -- swap_join: got both swapped halves → reassemble the warp structure --
-  if (fn == FN_SWAP_JOIN) {
-    u64 result0 = cont->slots[0];
-    u64 result1 = cont->slots[1];
-    u32 left_idx  = alloc_node(heap[node_index(result0)],     heap[node_index(result1)],     heap, heap_ptr);
-    u32 right_idx = alloc_node(heap[node_index(result0) + 1], heap[node_index(result1) + 1], heap, heap_ptr);
-    return make_value(make_node(alloc_node(make_node(left_idx), make_node(right_idx), heap, heap_ptr)));
-  }
-
-  // -- gen_join: got both generated subtrees → combine into Node --
-  if (fn == FN_GEN_JOIN) {
-    return make_value(make_node(alloc_node(cont->slots[0], cont->slots[1], heap, heap_ptr)));
-  }
-
-  // -- checksum_join: combine left and right checksums --
-  if (fn == FN_CSUM_JOIN) {
-    u32 depth     = cont->a0;
-    u32 left_sum  = (u32)cont->slots[0];
-    u32 right_sum = (u32)cont->slots[1];
-    u32 right_leaves = 1u << (depth - 1);
-    return make_value((u64)(left_sum * seq_pow31(right_leaves) + right_sum));
-  }
-
-  return make_value(0);
-}
+// ==========================================================================
 
 // ==========================================================================
 // Value Resolution
 // ==========================================================================
 //
-// When a task or continuation produces a VALUE, the runtime must deliver it:
-//   1. If the return address is ROOT_RETURN, the computation is done.
-//   2. Otherwise, decode the continuation index and slot from the return
-//      address, write the value into that slot, and atomically decrement
-//      the pending count.
-//   3. If we decremented pending from 1 → 0, we are the last child: fire
-//      the continuation. Its result may cascade (another VALUE going up,
-//      or new tasks via SPLIT/CALL).
-// ==========================================================================
+// When a VALUE is produced, deliver it to the parent continuation. If the
+// continuation becomes complete (pending == 0), fire it. The result may
+// cascade upward (another VALUE) or produce new tasks (SPLIT/CALL).
 
-__device__ void resolve_value(
-    u32  ret,
-    u64  value,
-    u64  *heap,
-    u32  &heap_ptr,
-    Continuation *conts,
-    u32  &cont_local_ptr,
-    u32  &cont_local_end,
-    u32  *cont_bump,
-    Task *output_buffer,
-    u32  *output_count,
-    u32  *done_flag,
-    u64  *root_result) {
-
+__device__ void resolve(u32 ret, u64 val, u64 *H, u32 &hp, Cont *C, u32 &lp, u32 &le, u32 *cb, Task *out, u32 *out_n, u32 *done, u64 *result) {
   for (;;) {
-    // Root computation is complete
-    if (ret == ROOT_RETURN) {
-      *root_result = value;
+    if (ret == ROOT_RET) {
+      *result = val;
       __threadfence();
-      atomicExch(done_flag, 1u);
+      atomicExch(done, 1u);
       return;
     }
 
-    // Decode return address: continuation index and slot
-    u32 cont_index = ret >> 1;
-    u32 slot       = ret & 1;
-    Continuation *cont = &conts[cont_index];
+    u32 ci = ret >> 1;
+    u32 slot = ret & 1;
+    Cont *co = &C[ci];
 
-    // Write our value into the continuation's slot
-    cont->slots[slot] = value;
+    co->slots[slot] = val;
     __threadfence();
 
-    // Atomically decrement pending count
-    u32 old_pending = atomicSub(&cont->pending, 1u);
-
-    // If we weren't the last child, we're done
-    if (old_pending != 1u) return;
-
-    // We were the last child — fire the continuation
-    __threadfence();
-    Result result = execute_continuation(
-      cont, heap, heap_ptr,
-      conts, cont_local_ptr, cont_local_end, cont_bump);
-
-    // Handle the continuation's result
-    if (result.tag == RESULT_VALUE) {
-      // Cascade: deliver this value to the continuation's parent
-      value = result.value;
-      ret   = cont->ret;
-      continue;  // Loop to resolve the parent
-    }
-    if (result.tag == RESULT_SPLIT) {
-      u32 idx = atomicAdd(output_count, 2u);
-      output_buffer[idx]     = result.child0;
-      output_buffer[idx + 1] = result.child1;
+    u32 old = atomicSub(&co->pend, 1u);
+    if (old != 1u) {
       return;
     }
-    if (result.tag == RESULT_CALL) {
-      u32 idx = atomicAdd(output_count, 1u);
-      output_buffer[idx] = result.child0;
+
+    // We were the last child — fire the continuation.
+    __threadfence();
+    Result r = dispatch_cont(co, H, hp, C, cb, lp, le);
+
+    if (r.tag == R_VALUE) {
+      val = r.val;
+      ret = co->ret;
+      continue;
+    }
+    if (r.tag == R_SPLIT) {
+      u32 i = atomicAdd(out_n, 2u);
+      out[i] = r.t0;
+      out[i + 1] = r.t1;
+      return;
+    }
+    if (r.tag == R_CALL) {
+      u32 i = atomicAdd(out_n, 1u);
+      out[i] = r.t0;
       return;
     }
     return;
@@ -710,334 +728,232 @@ __device__ void resolve_value(
 }
 
 // ==========================================================================
-// Debug: shade character for task count visualization
+// Debug Visualization
 // ==========================================================================
 
 #ifdef DEBUG_MATRIX
-__device__ const char* shade_char(u32 count) {
-  if (count == 0)                       return " ";
-  if (count <= (u32)(BLOCK_SIZE / 4))   return "░";
-  if (count <= (u32)(BLOCK_SIZE / 2))   return "▒";
-  if (count <= (u32)(3 * BLOCK_SIZE / 4)) return "▓";
+__device__ const char *shade(u32 n) {
+  if (n == 0)                    { return " "; }
+  if (n <= (u32)(BLOCK_SIZE / 4))  { return "░"; }
+  if (n <= (u32)(BLOCK_SIZE / 2))  { return "▒"; }
+  if (n <= (u32)(BLOCK_SIZE * 3 / 4)) { return "▓"; }
   return "█";
 }
 #endif
 
 // ==========================================================================
-// Main Cooperative Kernel
+// Evaluator Kernel
 // ==========================================================================
 //
-// This single persistent kernel runs the SEED → GROW → WORK loop until the
-// computation completes. Grid-wide synchronization (grid.sync()) separates
-// phases, eliminating all host↔device sync overhead.
-// ==========================================================================
+// Single persistent cooperative kernel. Loops SEED → GROW → WORK until the
+// root computation is complete. grid.sync() separates phases.
 
-__global__ void evaluator_kernel(GPUState state) {
+__global__ void evaluator(State S) {
   cg::grid_group grid = cg::this_grid();
+  int tid = threadIdx.x;
+  int bid = blockIdx.x;
+  int sid = bid * BLOCK_SIZE + tid;
 
-  int thread_id = threadIdx.x;
-  int block_id  = blockIdx.x;
-  int slot_id   = block_id * BLOCK_SIZE + thread_id;
-
-  // Shared memory: double buffer for SEED/GROW task expansion,
-  // and output buffer for WORK phase results.
-  __shared__ Task task_buf[2][BLOCK_SIZE];
-  __shared__ u32  buf_count;         // Current number of tasks in active buffer
-  __shared__ u32  buf_new_count;     // Count being built in the other buffer
-  __shared__ u32  cont_block_base;   // Base index for this block's continuation chunk
-  __shared__ u32  cont_block_used;   // How many conts this block has allocated
-  __shared__ Task work_output[BLOCK_SIZE];  // New tasks produced during WORK
-  __shared__ u32  work_output_count;
-  __shared__ u32  work_flat_base;    // Where in flat buffer to write our output
-  __shared__ u32  work_task_count;   // How many tasks this block has in WORK
+  __shared__ Task buf[2][BLOCK_SIZE];
+  __shared__ u32  cnt, cnt_new, cb_base, cb_used;
+  __shared__ Task out[BLOCK_SIZE];
+  __shared__ u32  out_n, out_base, work_n;
 
 #ifdef DEBUG_MATRIX
   int tick = 0;
 #endif
 
-  // ======================================================================
-  // Main loop: repeats SEED → GROW → WORK until done
-  // ======================================================================
   for (;;) {
     grid.sync();
+    u32 fc = *(volatile u32 *)S.flat_cnt;
+    if (fc == 0 || *(volatile u32 *)S.done) {
+      return;
+    }
 
-    // Check termination
-    u32 flat_count = *(volatile u32*)state.flat_count;
-    if (flat_count == 0 || *(volatile u32*)state.done_flag) return;
-
-    // ==================================================================
-    // SEED PHASE — Expand a small number of tasks to NUM_BLOCKS
-    // ==================================================================
-    // Only runs when flat_count ≤ NUM_BLOCKS (not enough to fill all blocks).
-    // Block 0 runs this alone. It loads the tasks into shared memory and
-    // iteratively splits them: each SPLIT result doubles the count.
-    // After enough iterations, we have NUM_BLOCKS tasks in the flat buffer.
-    //
-    // Only tasks that SPLIT or CALL contribute to the next iteration.
-    // VALUE results (base cases) are dropped — they resolve their
-    // continuations but don't add new tasks. For balanced bitonic sort,
-    // VALUE never occurs during SEED because depth > 0 on all paths.
-    // ==================================================================
-
-    if (flat_count <= (u32)NUM_BLOCKS) {
-      if (block_id == 0) {
-        // Load tasks from flat buffer into shared memory
-        if (thread_id < flat_count) {
-          task_buf[0][thread_id] = state.flat_buffer[thread_id];
+    // ── SEED ─────────────────────────────────────────────────────────
+    if (fc <= (u32)NUM_BLOCKS) {
+      if (bid == 0) {
+        if (tid < fc) {
+          buf[0][tid] = S.flat[tid];
         }
-        if (thread_id == 0) {
-          buf_count      = flat_count;
-          cont_block_used = 0;
-          cont_block_base = atomicAdd(state.cont_bump, 512u);
+        if (tid == 0) {
+          cnt = fc;
+          cb_used = 0;
+          cb_base = atomicAdd(S.cont_bump, 512u);
         }
         __syncthreads();
 
-        u32 heap_ptr = state.heap_pointers[thread_id];
-        int current_buf = 0;
+        u32 hp = S.heap_ptrs[tid];
+        int cur = 0;
 
-        // Iterate: each round, active threads execute their task and collect
-        // children into the alternate buffer. Stop when we have enough tasks
-        // or when no more splitting occurs.
-        // Guard: sn <= NUM_BLOCKS/2 ensures a full SPLIT round can't exceed NUM_BLOCKS.
-        for (int iter = 0; iter < 32 && buf_count > 0 && buf_count <= (u32)(NUM_BLOCKS / 2); iter++) {
-          if (thread_id == 0) buf_new_count = 0;
-          __syncthreads();
-
-          u32 active_count = buf_count;
-          if (thread_id < active_count) {
-            u32 cont_idx = cont_block_base + atomicAdd(&cont_block_used, 1u);
-            Result result = execute_task_split(
-              task_buf[current_buf][thread_id],
-              state.heap, heap_ptr, state.continuations, cont_idx);
-
-            if (result.tag == RESULT_SPLIT) {
-              u32 dest = atomicAdd(&buf_new_count, 2u);
-              task_buf[1 - current_buf][dest]     = result.child0;
-              task_buf[1 - current_buf][dest + 1] = result.child1;
-            } else if (result.tag == RESULT_CALL) {
-              u32 dest = atomicAdd(&buf_new_count, 1u);
-              task_buf[1 - current_buf][dest] = result.child0;
-            }
-            // VALUE results: continuation slot is filled but task is not re-queued
+        for (int i = 0; i < 32 && cnt > 0 && cnt <= (u32)(NUM_BLOCKS / 2); i++) {
+          if (tid == 0) {
+            cnt_new = 0;
           }
           __syncthreads();
 
-          current_buf = 1 - current_buf;
-          if (thread_id == 0) buf_count = buf_new_count;
+          if (tid < cnt) {
+            u32 ci = cb_base + atomicAdd(&cb_used, 1u);
+            Result r = dispatch_split(buf[cur][tid], S.heap, hp, S.conts, ci);
+            if (r.tag == R_SPLIT) {
+              u32 j = atomicAdd(&cnt_new, 2u);
+              buf[1 - cur][j] = r.t0;
+              buf[1 - cur][j + 1] = r.t1;
+            } else if (r.tag == R_CALL) {
+              u32 j = atomicAdd(&cnt_new, 1u);
+              buf[1 - cur][j] = r.t0;
+            }
+          }
+          __syncthreads();
+          cur = 1 - cur;
+          if (tid == 0) {
+            cnt = cnt_new;
+          }
           __syncthreads();
         }
 
-        // Write expanded tasks back to flat buffer
-        if (thread_id < buf_count) {
-          state.flat_buffer[thread_id] = task_buf[current_buf][thread_id];
+        if (tid < cnt) {
+          S.flat[tid] = buf[cur][tid];
         }
-        state.heap_pointers[thread_id] = heap_ptr;
-        if (thread_id == 0) {
-          *state.flat_count = buf_count;
+        S.heap_ptrs[tid] = hp;
+        if (tid == 0) {
+          *S.flat_cnt = cnt;
           __threadfence();
         }
         __syncthreads();
 
 #ifdef DEBUG_MATRIX
-        if (thread_id == 0) {
+        if (tid == 0) {
           printf("S%04d:", tick++);
-          for (int b = 0; b < NUM_BLOCKS; b++)
-            printf("%s", shade_char((b == 0) ? buf_count : 0));
+          for (int b = 0; b < NUM_BLOCKS; b++) {
+            printf("%s", shade(b == 0 ? cnt : 0));
+          }
           printf("\n");
         }
 #endif
       }
 
       grid.sync();
-      flat_count = *(volatile u32*)state.flat_count;
-      if (flat_count == 0) return;
+      fc = *(volatile u32 *)S.flat_cnt;
+      if (fc == 0) {
+        return;
+      }
     }
 
-    // ==================================================================
-    // GROW PHASE — Expand each block's tasks from flat buffer to BLOCK_SIZE
-    // ==================================================================
-    // The flat buffer has flat_count tasks. Distribute them evenly across
-    // NUM_BLOCKS blocks. Each block loads its share into shared memory and
-    // iteratively splits, just like SEED, until it has BLOCK_SIZE tasks.
-    // Results are written to the task_matrix in column-major order.
-    // ==================================================================
-
+    // ── GROW ─────────────────────────────────────────────────────────
     {
-      // Compute how many tasks this block gets from the flat buffer
-      u32 tasks_per_block = flat_count / NUM_BLOCKS;
-      u32 extra_tasks     = flat_count % NUM_BLOCKS;
-      u32 my_task_count   = tasks_per_block + ((u32)block_id < extra_tasks ? 1u : 0u);
-      u32 my_base_offset  = block_id * tasks_per_block + ((u32)block_id < extra_tasks ? (u32)block_id : extra_tasks);
+      u32 per = fc / NUM_BLOCKS;
+      u32 extra = fc % NUM_BLOCKS;
+      u32 my_n = per + ((u32)bid < extra ? 1u : 0u);
+      u32 my_off = bid * per + ((u32)bid < extra ? (u32)bid : extra);
 
-      // Load our share into shared memory
-      if (thread_id < my_task_count) {
-        task_buf[0][thread_id] = state.flat_buffer[my_base_offset + thread_id];
+      if (tid < my_n) {
+        buf[0][tid] = S.flat[my_off + tid];
       }
-      if (thread_id == 0) {
-        buf_count       = my_task_count;
-        cont_block_used = 0;
-        cont_block_base = atomicAdd(state.cont_bump, 256u);
+      if (tid == 0) {
+        cnt = my_n;
+        cb_used = 0;
+        cb_base = atomicAdd(S.cont_bump, 256u);
       }
       __syncthreads();
 
-      u32 heap_ptr = state.heap_pointers[slot_id];
-      int current_buf = 0;
+      u32 hp = S.heap_ptrs[sid];
+      int cur = 0;
 
-      // Same doubling loop as SEED, but per-block and targeting BLOCK_SIZE
-      for (int iter = 0; iter < 32 && buf_count > 0 && buf_count <= (u32)(BLOCK_SIZE / 2); iter++) {
-        if (thread_id == 0) buf_new_count = 0;
-        __syncthreads();
-
-        u32 active_count = buf_count;
-        if (thread_id < active_count) {
-          u32 cont_idx = cont_block_base + atomicAdd(&cont_block_used, 1u);
-          Result result = execute_task_split(
-            task_buf[current_buf][thread_id],
-            state.heap, heap_ptr, state.continuations, cont_idx);
-
-          if (result.tag == RESULT_SPLIT) {
-            u32 dest = atomicAdd(&buf_new_count, 2u);
-            task_buf[1 - current_buf][dest]     = result.child0;
-            task_buf[1 - current_buf][dest + 1] = result.child1;
-          } else if (result.tag == RESULT_CALL) {
-            u32 dest = atomicAdd(&buf_new_count, 1u);
-            task_buf[1 - current_buf][dest] = result.child0;
-          }
+      for (int i = 0; i < 32 && cnt > 0 && cnt <= (u32)(BLOCK_SIZE / 2); i++) {
+        if (tid == 0) {
+          cnt_new = 0;
         }
         __syncthreads();
 
-        current_buf = 1 - current_buf;
-        if (thread_id == 0) buf_count = buf_new_count;
+        if (tid < cnt) {
+          u32 ci = cb_base + atomicAdd(&cb_used, 1u);
+          Result r = dispatch_split(buf[cur][tid], S.heap, hp, S.conts, ci);
+          if (r.tag == R_SPLIT) {
+            u32 j = atomicAdd(&cnt_new, 2u);
+            buf[1 - cur][j] = r.t0;
+            buf[1 - cur][j + 1] = r.t1;
+          } else if (r.tag == R_CALL) {
+            u32 j = atomicAdd(&cnt_new, 1u);
+            buf[1 - cur][j] = r.t0;
+          }
+        }
+        __syncthreads();
+        cur = 1 - cur;
+        if (tid == 0) {
+          cnt = cnt_new;
+        }
         __syncthreads();
       }
 
-      // Write to column-format task matrix and record per-block count
-      if (thread_id < buf_count) {
-        state.task_matrix[block_id * BLOCK_SIZE + thread_id] = task_buf[current_buf][thread_id];
+      if (tid < cnt) {
+        S.tasks[bid * BLOCK_SIZE + tid] = buf[cur][tid];
       }
-      state.heap_pointers[slot_id] = heap_ptr;
-      if (thread_id == 0) {
-        state.block_counts[block_id] = buf_count;
+      S.heap_ptrs[sid] = hp;
+      if (tid == 0) {
+        S.block_cnt[bid] = cnt;
       }
       __syncthreads();
     }
 
 #ifdef DEBUG_MATRIX
     grid.sync();
-    if (block_id == 0 && thread_id == 0) {
+    if (bid == 0 && tid == 0) {
       printf("G%04d:", tick++);
-      for (int b = 0; b < NUM_BLOCKS; b++)
-        printf("%s", shade_char(state.block_counts[b]));
+      for (int b = 0; b < NUM_BLOCKS; b++) {
+        printf("%s", shade(S.block_cnt[b]));
+      }
       printf("\n");
     }
     grid.sync();
 #endif
 
-    // Reset flat_count before WORK (must be visible to all blocks)
-    if (block_id == 0 && thread_id == 0) {
-      *state.flat_count = 0;
+    if (bid == 0 && tid == 0) {
+      *S.flat_cnt = 0;
     }
     grid.sync();
 
-    // ==================================================================
-    // WORK PHASE — Execute all tasks sequentially, resolve continuations
-    // ==================================================================
-    // Each thread executes its assigned task by calling the sequential
-    // (recursive) version of the function. The result is a VALUE that gets
-    // fed into the continuation resolution chain. Fired continuations may
-    // produce new tasks (SPLIT/CALL) which are collected in shared memory
-    // and then bulk-written to the flat buffer for the next round.
-    // ==================================================================
-
+    // ── WORK ─────────────────────────────────────────────────────────
     {
-      if (thread_id == 0) {
-        work_output_count = 0;
-        work_task_count   = state.block_counts[block_id];
+      if (tid == 0) {
+        out_n = 0;
+        work_n = S.block_cnt[bid];
       }
       __syncthreads();
 
-      u32 heap_ptr       = state.heap_pointers[slot_id];
-      u32 cont_local_ptr = 0;
-      u32 cont_local_end = 0;
+      u32 hp = S.heap_ptrs[sid];
+      u32 clp = 0, cle = 0;
 
-      // Only execute if this thread has a valid task
-      if (thread_id < work_task_count) {
-        Task task = state.task_matrix[slot_id];
-        u64 value;
-
-        // Dispatch to the appropriate sequential function
-        switch (task.fn) {
-          case FN_SORT: {
-            u32 depth = unpack_low(task.args[0]);
-            u32 side  = unpack_high(task.args[0]);
-            value = seq_sort(depth, side, task.args[1], state.heap, heap_ptr);
-            break;
-          }
-          case FN_FLOW: {
-            u32 depth = unpack_low(task.args[0]);
-            u32 side  = unpack_high(task.args[0]);
-            value = seq_flow(depth, side, task.args[1], state.heap, heap_ptr);
-            break;
-          }
-          case FN_SWAP: {
-            u32 side  = unpack_low(task.args[0]);
-            u32 depth = unpack_high(task.args[0]);
-            u64 tree  = task.args[1];
-            value = seq_warp(depth, side,
-                             state.heap[node_index(tree)],
-                             state.heap[node_index(tree) + 1],
-                             state.heap, heap_ptr);
-            break;
-          }
-          case FN_GEN: {
-            u32 depth = unpack_low(task.args[0]);
-            u32 x     = unpack_high(task.args[0]);
-            value = seq_gen(depth, x, state.heap, heap_ptr);
-            break;
-          }
-          case FN_CSUM: {
-            u32 depth = unpack_low(task.args[0]);
-            value = seq_checksum(task.args[1], depth, state.heap);
-            break;
-          }
-          default:
-            value = 0;
-        }
-
-        // Resolve: deliver value to parent continuation, possibly cascading
-        resolve_value(
-          task.ret, value,
-          state.heap, heap_ptr,
-          state.continuations, cont_local_ptr, cont_local_end, state.cont_bump,
-          work_output, &work_output_count,
-          state.done_flag, state.root_result);
-      }
-
-      __syncthreads();
-      state.heap_pointers[slot_id] = heap_ptr;
-
-      // Bulk-write new tasks from shared memory to the global flat buffer.
-      // One atomic per block (not per thread) to claim space.
-      u32 output_count = work_output_count;
-      if (thread_id == 0 && output_count > 0) {
-        work_flat_base = atomicAdd(state.flat_count, output_count);
+      if (tid < work_n) {
+        Task task = S.tasks[sid];
+        u64 val = dispatch_seq(task, S.heap, hp);
+        resolve(task.ret, val, S.heap, hp, S.conts, clp, cle, S.cont_bump, out, &out_n, S.done, S.result);
       }
       __syncthreads();
-      for (u32 i = thread_id; i < output_count; i += BLOCK_SIZE) {
-        state.flat_buffer[work_flat_base + i] = work_output[i];
+
+      S.heap_ptrs[sid] = hp;
+
+      u32 n = out_n;
+      if (tid == 0 && n > 0) {
+        out_base = atomicAdd(S.flat_cnt, n);
+      }
+      __syncthreads();
+      for (u32 i = tid; i < n; i += BLOCK_SIZE) {
+        S.flat[out_base + i] = out[i];
       }
       __syncthreads();
     }
 
 #ifdef DEBUG_MATRIX
     grid.sync();
-    if (block_id == 0 && thread_id == 0) {
-      u32 fc    = *(volatile u32*)state.flat_count;
-      u32 per_b = fc / NUM_BLOCKS;
-      u32 extra = fc % NUM_BLOCKS;
+    if (bid == 0 && tid == 0) {
+      u32 fc2 = *(volatile u32 *)S.flat_cnt;
+      u32 per = fc2 / NUM_BLOCKS;
+      u32 extra = fc2 % NUM_BLOCKS;
       printf("W%04d:", tick++);
-      for (int b = 0; b < NUM_BLOCKS; b++)
-        printf("%s", shade_char(per_b + ((u32)b < extra ? 1 : 0)));
+      for (int b = 0; b < NUM_BLOCKS; b++) {
+        printf("%s", shade(per + ((u32)b < extra ? 1 : 0)));
+      }
       printf("\n");
     }
     grid.sync();
@@ -1046,34 +962,28 @@ __global__ void evaluator_kernel(GPUState state) {
 }
 
 // ==========================================================================
-// Host-side: Run one top-level function through the evaluator
-// ==========================================================================
-//
-// Resets the done flag and continuation allocator, places a single task in
-// the flat buffer, and launches the cooperative kernel. The kernel will
-// SEED → GROW → WORK until the result is produced.
+// Host: launch one top-level task through the evaluator
 // ==========================================================================
 
-static void run_task(GPUState &state, u32 fn, u64 arg0, u64 arg1, float *elapsed_ms) {
+static void run(State &S, u32 fn, u64 a0, u64 a1, float *ms) {
   u32 zero = 0;
-  CUDA_CHECK(cudaMemcpy(state.done_flag,  &zero, sizeof(u32), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(state.cont_bump,  &zero, sizeof(u32), cudaMemcpyHostToDevice));
+  CHK(cudaMemcpy(S.done, &zero, sizeof(u32), cudaMemcpyHostToDevice));
+  CHK(cudaMemcpy(S.cont_bump, &zero, sizeof(u32), cudaMemcpyHostToDevice));
 
-  Task initial_task = make_task(fn, ROOT_RETURN, arg0, arg1);
-  CUDA_CHECK(cudaMemcpy(state.flat_buffer, &initial_task, sizeof(Task), cudaMemcpyHostToDevice));
+  Task t = make_task(fn, ROOT_RET, a0, a1);
+  CHK(cudaMemcpy(S.flat, &t, sizeof(Task), cudaMemcpyHostToDevice));
 
   u32 one = 1;
-  CUDA_CHECK(cudaMemcpy(state.flat_count, &one, sizeof(u32), cudaMemcpyHostToDevice));
+  CHK(cudaMemcpy(S.flat_cnt, &one, sizeof(u32), cudaMemcpyHostToDevice));
 
-  void *kernel_args[] = { &state };
-
-  cudaEvent_t start, stop;
-  CUDA_CHECK(cudaEventCreate(&start));
-  CUDA_CHECK(cudaEventCreate(&stop));
-  CUDA_CHECK(cudaEventRecord(start));
-  CUDA_CHECK(cudaLaunchCooperativeKernel((void*)evaluator_kernel, NUM_BLOCKS, BLOCK_SIZE, kernel_args));
-  CUDA_CHECK(cudaEventRecord(stop));
-  CUDA_CHECK(cudaDeviceSynchronize());
+  void *args[] = { &S };
+  cudaEvent_t t0, t1;
+  CHK(cudaEventCreate(&t0));
+  CHK(cudaEventCreate(&t1));
+  CHK(cudaEventRecord(t0));
+  CHK(cudaLaunchCooperativeKernel((void *)evaluator, NUM_BLOCKS, BLOCK_SIZE, args));
+  CHK(cudaEventRecord(t1));
+  CHK(cudaDeviceSynchronize());
 
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
@@ -1081,9 +991,9 @@ static void run_task(GPUState &state, u32 fn, u64 arg0, u64 arg1, float *elapsed
     exit(1);
   }
 
-  CUDA_CHECK(cudaEventElapsedTime(elapsed_ms, start, stop));
-  CUDA_CHECK(cudaEventDestroy(start));
-  CUDA_CHECK(cudaEventDestroy(stop));
+  CHK(cudaEventElapsedTime(ms, t0, t1));
+  CHK(cudaEventDestroy(t0));
+  CHK(cudaEventDestroy(t1));
 }
 
 // ==========================================================================
@@ -1092,95 +1002,76 @@ static void run_task(GPUState &state, u32 fn, u64 arg0, u64 arg1, float *elapsed
 
 int main(int argc, char **argv) {
   int depth = 20;
-  if (argc > 1) depth = atoi(argv[1]);
+  if (argc > 1) {
+    depth = atoi(argv[1]);
+  }
   if (depth < 1 || depth > 24) {
-    fprintf(stderr, "Usage: %s [depth]  (depth 1..24)\n", argv[0]);
+    fprintf(stderr, "Usage: %s [depth 1..24]\n", argv[0]);
     return 1;
   }
-  u32 num_elements = 1u << depth;
+
   fprintf(stderr, "Bitonic sort  depth=%d  elems=%u  (%d blocks × %d threads)\n",
-          depth, num_elements, NUM_BLOCKS, BLOCK_SIZE);
+          depth, 1u << depth, NUM_BLOCKS, BLOCK_SIZE);
 
-  CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 8192));
+  CHK(cudaDeviceSetLimit(cudaLimitStackSize, 8192));
 
-  // --------------------------------------------------------------------------
-  // Allocate all GPU memory in a single cudaMalloc to minimize overhead.
-  // --------------------------------------------------------------------------
+  // -- Allocate all GPU memory in one call --
+  #define ALIGN(x) (((x) + 255) & ~(size_t)255)
+  size_t off = 0;
+  size_t p_heap = off; off += ALIGN((size_t)HEAP_SIZE * 8);
+  size_t p_hptr = off; off += ALIGN((size_t)NUM_SLOTS * 4);
+  size_t p_cont = off; off += ALIGN((size_t)CONT_CAP * sizeof(Cont));
+  size_t p_cbmp = off; off += ALIGN(4);
+  size_t p_task = off; off += ALIGN((size_t)NUM_SLOTS * sizeof(Task));
+  size_t p_flat = off; off += ALIGN((size_t)NUM_SLOTS * sizeof(Task));
+  size_t p_fcnt = off; off += ALIGN(4);
+  size_t p_bcnt = off; off += ALIGN((size_t)NUM_BLOCKS * 4);
+  size_t p_done = off; off += ALIGN(4);
+  size_t p_res  = off; off += ALIGN(8);
 
-  #define ALIGN256(x) (((x) + 255) & ~(size_t)255)
+  char *mem;
+  CHK(cudaMalloc(&mem, off));
+  CHK(cudaMemset(mem, 0, off));
 
-  size_t offset = 0;
-  size_t off_heap      = offset; offset += ALIGN256((size_t)HEAP_SIZE * sizeof(u64));
-  size_t off_heap_ptrs = offset; offset += ALIGN256((size_t)TOTAL_SLOTS * sizeof(u32));
-  size_t off_conts     = offset; offset += ALIGN256((size_t)CONT_CAP * sizeof(Continuation));
-  size_t off_cont_bump = offset; offset += ALIGN256(sizeof(u32));
-  size_t off_tasks     = offset; offset += ALIGN256((size_t)TOTAL_SLOTS * sizeof(Task));
-  size_t off_flat      = offset; offset += ALIGN256((size_t)TOTAL_SLOTS * sizeof(Task));
-  size_t off_flat_cnt  = offset; offset += ALIGN256(sizeof(u32));
-  size_t off_blk_cnts  = offset; offset += ALIGN256((size_t)NUM_BLOCKS * sizeof(u32));
-  size_t off_done      = offset; offset += ALIGN256(sizeof(u32));
-  size_t off_result    = offset; offset += ALIGN256(sizeof(u64));
+  State S;
+  S.heap      = (u64  *)(mem + p_heap);
+  S.heap_ptrs = (u32  *)(mem + p_hptr);
+  S.conts     = (Cont *)(mem + p_cont);
+  S.cont_bump = (u32  *)(mem + p_cbmp);
+  S.tasks     = (Task *)(mem + p_task);
+  S.flat      = (Task *)(mem + p_flat);
+  S.flat_cnt  = (u32  *)(mem + p_fcnt);
+  S.block_cnt = (u32  *)(mem + p_bcnt);
+  S.done      = (u32  *)(mem + p_done);
+  S.result    = (u64  *)(mem + p_res);
 
-  char *device_memory;
-  CUDA_CHECK(cudaMalloc(&device_memory, offset));
-  CUDA_CHECK(cudaMemset(device_memory, 0, offset));
-
-  GPUState state;
-  state.heap          = (u64 *)         (device_memory + off_heap);
-  state.heap_pointers = (u32 *)         (device_memory + off_heap_ptrs);
-  state.continuations = (Continuation *)(device_memory + off_conts);
-  state.cont_bump     = (u32 *)         (device_memory + off_cont_bump);
-  state.task_matrix   = (Task *)        (device_memory + off_tasks);
-  state.flat_buffer   = (Task *)        (device_memory + off_flat);
-  state.flat_count    = (u32 *)         (device_memory + off_flat_cnt);
-  state.block_counts  = (u32 *)         (device_memory + off_blk_cnts);
-  state.done_flag     = (u32 *)         (device_memory + off_done);
-  state.root_result   = (u64 *)         (device_memory + off_result);
-
-  // Initialize per-slot heap pointers: each slot gets an equal slice of the heap.
-  u32 slice_size = HEAP_SIZE / TOTAL_SLOTS;
-  u32 *host_heap_ptrs = (u32 *)malloc(TOTAL_SLOTS * sizeof(u32));
-  for (int i = 0; i < TOTAL_SLOTS; i++) {
-    host_heap_ptrs[i] = (u32)i * slice_size;
+  // -- Per-slot heap slices --
+  u32 slice = HEAP_SIZE / NUM_SLOTS;
+  u32 *hps = (u32 *)malloc(NUM_SLOTS * sizeof(u32));
+  for (int i = 0; i < NUM_SLOTS; i++) {
+    hps[i] = (u32)i * slice;
   }
-  CUDA_CHECK(cudaMemcpy(state.heap_pointers, host_heap_ptrs, TOTAL_SLOTS * sizeof(u32), cudaMemcpyHostToDevice));
-  free(host_heap_ptrs);
+  CHK(cudaMemcpy(S.heap_ptrs, hps, NUM_SLOTS * sizeof(u32), cudaMemcpyHostToDevice));
+  free(hps);
 
-  // --------------------------------------------------------------------------
-  // Run the three phases of the computation — all on GPU, all through the
-  // same evaluator pipeline:
-  //
-  //   1. gen(depth, 0)         → builds the input tree
-  //   2. sort(depth, 0, tree)  → sorts it via bitonic sort
-  //   3. checksum(tree, depth) → computes a verification checksum
-  // --------------------------------------------------------------------------
-
+  // -- Run: gen → sort → checksum --
   float ms;
+  u64 tree, sorted, cksum;
 
-  // Phase 1: Generate the input tree on the GPU
-  run_task(state, FN_GEN, pack(depth, 0), 0, &ms);
-  u64 input_tree;
-  CUDA_CHECK(cudaMemcpy(&input_tree, state.root_result, sizeof(u64), cudaMemcpyDeviceToHost));
+  run(S, FN_GEN, pack(depth, 0), 0, &ms);
+  CHK(cudaMemcpy(&tree, S.result, sizeof(u64), cudaMemcpyDeviceToHost));
   fprintf(stderr, "  gen  %.1f ms\n", ms);
 
-  // Phase 2: Sort the tree
-  run_task(state, FN_SORT, pack(depth, 0), input_tree, &ms);
-  u64 sorted_tree;
-  CUDA_CHECK(cudaMemcpy(&sorted_tree, state.root_result, sizeof(u64), cudaMemcpyDeviceToHost));
+  run(S, FN_SORT, pack(depth, 0), tree, &ms);
+  CHK(cudaMemcpy(&sorted, S.result, sizeof(u64), cudaMemcpyDeviceToHost));
   fprintf(stderr, "  sort %.1f ms\n", ms);
 
-  // Phase 3: Checksum the sorted tree
-  run_task(state, FN_CSUM, pack(depth, 0), sorted_tree, &ms);
-  u64 checksum;
-  CUDA_CHECK(cudaMemcpy(&checksum, state.root_result, sizeof(u64), cudaMemcpyDeviceToHost));
+  run(S, FN_CSUM, pack(depth, 0), sorted, &ms);
+  CHK(cudaMemcpy(&cksum, S.result, sizeof(u64), cudaMemcpyDeviceToHost));
   fprintf(stderr, "  csum %.1f ms\n", ms);
 
-  printf("%u\n", (u32)checksum);
+  printf("%u\n", (u32)cksum);
 
-  // --------------------------------------------------------------------------
-  // Cleanup
-  // --------------------------------------------------------------------------
-
-  CUDA_CHECK(cudaFree(device_memory));
+  CHK(cudaFree(mem));
   return 0;
 }
