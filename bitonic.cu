@@ -159,7 +159,7 @@ __host__ __device__ inline u32 get_val(u64 t) {
 }
 
 __host__ __device__ inline u32 get_idx(u64 t) {
-  return (u32)(t & 0x7FFFFFFFu);
+  return (u32)(t & 0xFFFFFFFFu);
 }
 
 // Runtime Structures
@@ -697,7 +697,11 @@ __global__ void evaluator(State S) {
   __shared__ Task buf[2][BLOCK_SIZE];
   __shared__ u32  cnt, cnt_new, cb_base, cb_used;
   __shared__ Task out[BLOCK_SIZE];
-  __shared__ u32  out_n, out_base, work_n;
+  __shared__ u32  out_n, out_base;
+  __shared__ u32  grow_cur;
+
+  // Keep heap pointer in register across all rounds.
+  u32 hp = S.heap_ptrs[sid];
 
 #ifdef DEBUG_MATRIX
   int tick = 0;
@@ -707,15 +711,15 @@ __global__ void evaluator(State S) {
     grid.sync();
     u32 fc = *(volatile u32 *)S.flat_cnt;
     if (fc == 0 || *(volatile u32 *)S.done) {
-      return;
+      break;
     }
 
     // SEED
     // ----
-    // Block 0 iteratively splits ≤ NUM_BLOCKS tasks until we have one per
-    // block. Other blocks wait at the grid.sync() below.
+    // Block 0 iteratively splits < NUM_BLOCKS tasks until we have one
+    // per block. Other blocks wait at the grid.sync() below.
 
-    if (fc <= (u32)NUM_BLOCKS) {
+    if (fc < (u32)NUM_BLOCKS) {
       if (bid == 0) {
         if (tid < fc) {
           buf[0][tid] = S.flat[tid];
@@ -727,7 +731,6 @@ __global__ void evaluator(State S) {
         }
         __syncthreads();
 
-        u32 hp = S.heap_ptrs[tid];
         int cur = 0;
 
         for (int i = 0; i < 32 && cnt > 0 && cnt <= (u32)(NUM_BLOCKS / 2); i++) {
@@ -759,7 +762,6 @@ __global__ void evaluator(State S) {
         if (tid < cnt) {
           S.flat[tid] = buf[cur][tid];
         }
-        S.heap_ptrs[tid] = hp;
         if (tid == 0) {
           *S.flat_cnt = cnt;
           __threadfence();
@@ -780,14 +782,14 @@ __global__ void evaluator(State S) {
       grid.sync();
       fc = *(volatile u32 *)S.flat_cnt;
       if (fc == 0) {
-        return;
+        break;
       }
     }
 
     // GROW
     // ----
     // Each block loads its share of the flat buffer and iteratively splits
-    // until it has BLOCK_SIZE tasks. Results go to the task matrix.
+    // until it has BLOCK_SIZE tasks.
 
     {
       u32 per = fc / NUM_BLOCKS;
@@ -805,7 +807,6 @@ __global__ void evaluator(State S) {
       }
       __syncthreads();
 
-      u32 hp = S.heap_ptrs[sid];
       int cur = 0;
 
       for (int i = 0; i < 32 && cnt > 0 && cnt <= (u32)(BLOCK_SIZE / 2); i++) {
@@ -834,13 +835,16 @@ __global__ void evaluator(State S) {
         __syncthreads();
       }
 
-      if (tid < cnt) {
-        S.tasks[bid * BLOCK_SIZE + tid] = buf[cur][tid];
+      // Save cur so WORK can read tasks from buf[cur][tid].
+      if (tid == 0) {
+        grow_cur = cur;
       }
-      S.heap_ptrs[sid] = hp;
+
+#ifdef DEBUG_MATRIX
       if (tid == 0) {
         S.block_cnt[bid] = cnt;
       }
+#endif
       __syncthreads();
     }
 
@@ -870,21 +874,17 @@ __global__ void evaluator(State S) {
     {
       if (tid == 0) {
         out_n = 0;
-        work_n = S.block_cnt[bid];
       }
       __syncthreads();
 
-      u32 hp = S.heap_ptrs[sid];
       u32 clp = 0, cle = 0;
 
-      if (tid < work_n) {
-        Task task = S.tasks[sid];
+      if (tid < cnt) {
+        Task task = buf[grow_cur][tid];
         u64 val = dispatch_seq(task, S.heap, hp);
         resolve(task.ret, val, S.heap, hp, S.conts, clp, cle, S.cont_bump, out, &out_n, S.done, S.result);
       }
       __syncthreads();
-
-      S.heap_ptrs[sid] = hp;
 
       u32 n = out_n;
       if (tid == 0 && n > 0) {
@@ -894,7 +894,6 @@ __global__ void evaluator(State S) {
       for (u32 i = tid; i < n; i += BLOCK_SIZE) {
         S.flat[out_base + i] = out[i];
       }
-      __syncthreads();
     }
 
 #ifdef DEBUG_MATRIX
@@ -912,6 +911,9 @@ __global__ void evaluator(State S) {
     grid.sync();
 #endif
   }
+
+  // Write heap pointer back once at kernel exit (instead of every round).
+  S.heap_ptrs[sid] = hp;
 }
 
 // Host
@@ -930,6 +932,12 @@ static void run(State &S, u32 fn, u64 a0, u64 a1, float *ms) {
 
   u32 one = 1;
   CHK(cudaMemcpy(S.flat_cnt, &one, sizeof(u32), cudaMemcpyHostToDevice));
+
+  // Maximize L1 cache (minimize shared memory carveout).
+  CHK(cudaFuncSetAttribute(
+    (void *)evaluator,
+    cudaFuncAttributePreferredSharedMemoryCarveout,
+    cudaSharedmemCarveoutMaxL1));
 
   void *args[] = { &S };
   cudaEvent_t t0, t1;
