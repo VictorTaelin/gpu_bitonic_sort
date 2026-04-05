@@ -1,32 +1,30 @@
-// ==========================================================================
-// bitonic.cu — GPU Parallel Evaluator for Recursive Functional Programs
-// ==========================================================================
+// bitonic.cu
+// =========
 //
-// This file implements a general-purpose parallel evaluator for pure
-// recursive functions on the GPU. It takes functions written in a simple
-// functional style (like the C reference in bitonic.c) and "manually
-// compiles" them into a task-based GPU runtime that exploits parallelism.
+// GPU parallel evaluator for recursive functional programs, demonstrated
+// with bitonic sort. Takes pure recursive functions (see bitonic.c) and
+// "manually compiles" them into a task-based runtime on the GPU.
 //
-// The runtime is fully generic — it knows nothing about sort, flow, warp,
-// gen, or checksum. All algorithm-specific code lives in a single section
-// marked "COMPILED FUNCTIONS", which a future compiler would generate
-// automatically. Everything else (the scheduler, allocator, resolver) is
-// reusable infrastructure.
+// The runtime is generic: it knows nothing about sort, flow, warp, gen, or
+// checksum. All algorithm-specific code lives in the "Compiled Functions"
+// section below, which a future compiler would auto-generate. Everything
+// else is reusable infrastructure.
 //
-// ==========================================================================
-// THE ORIGINAL ALGORITHM (from bitonic.c — cannot be changed)
-// ==========================================================================
+// The Original Algorithm
+// ----------------------
+//
+// From bitonic.c (cannot be changed):
 //
 //   gen(d, x):
 //     if d == 0: return Leaf(x)
-//     l = gen(d-1, x*2+1)   // PARALLEL
-//     r = gen(d-1, x*2)     // PARALLEL
+//     l = gen(d-1, x*2+1)                    // PARALLEL
+//     r = gen(d-1, x*2)                      // PARALLEL
 //     return Node(l, r)
 //
 //   sort(d, s, t):
 //     if d == 0 or is_leaf(t): return t
-//     l = sort(d-1, 0, left(t))   // PARALLEL
-//     r = sort(d-1, 1, right(t))  // PARALLEL
+//     l = sort(d-1, 0, left(t))              // PARALLEL
+//     r = sort(d-1, 1, right(t))             // PARALLEL
 //     return flow(d, s, Node(l, r))
 //
 //   flow(d, s, t):
@@ -36,90 +34,76 @@
 //
 //   down(d, s, t):
 //     if d == 0 or is_leaf(t): return t
-//     l = flow(d-1, s, left(t))   // PARALLEL
-//     r = flow(d-1, s, right(t))  // PARALLEL
+//     l = flow(d-1, s, left(t))              // PARALLEL
+//     r = flow(d-1, s, right(t))             // PARALLEL
 //     return Node(l, r)
 //
 //   warp(d, s, a, b):
-//     if d == 0: compare-and-swap leaves a,b by direction s
+//     if d == 0: compare-and-swap leaves
 //     l = warp(d-1, s, left(a),  left(b))    // PARALLEL
 //     r = warp(d-1, s, right(a), right(b))   // PARALLEL
 //     return Node(Node(left(l),left(r)), Node(right(l),right(r)))
 //
-//   checksum(t):
-//     if is_leaf(t): return val(t)
-//     return checksum(left(t)) * 31^(leaf_count(right(t))) + checksum(right(t))
+//   checksum(t, d):
+//     if d == 0: return val(t)
+//     l = checksum(left(t), d-1)             // PARALLEL
+//     r = checksum(right(t), d-1)            // PARALLEL
+//     return l * 31^(2^(d-1)) + r
 //
-// Lines marked PARALLEL are where two independent recursive calls can run
-// concurrently. This evaluator exploits that parallelism on the GPU.
+// Lines marked PARALLEL have two independent recursive calls that this
+// evaluator runs concurrently on the GPU.
 //
-// ==========================================================================
-// HOW THE COMPILER WORKS
-// ==========================================================================
+// How the Compiler Works
+// ----------------------
 //
-// Each function with a PARALLEL annotation is compiled into two parts:
+// Each function with a PARALLEL annotation compiles into:
 //
-//   par_<name>_0 (the "splitter"):
-//     Checks base cases. If not a base case, allocates a Continuation and
-//     returns SPLIT(child_task_0, child_task_1). The continuation stores
-//     which "join" function to call when both children complete.
+//   seq_<name>     Direct recursive implementation (for WORK phase).
+//   par_<name>_0   "Splitter": checks base cases, returns SPLIT or CALL.
+//   par_<name>_1   "Joiner": continuation handler, combines child results.
 //
-//   par_<name>_1 (the "joiner" / continuation handler):
-//     Called when both children have produced values. Combines the results
-//     (e.g., Node(left, right)) and returns the final VALUE — or chains
-//     into another function via CALL.
+// A task function returns one of three results:
+//   VALUE(v)        Computation complete.
+//   SPLIT(t0, t1)   Two parallel sub-calls needed (creates a continuation).
+//   CALL(t0)        One sub-call needed (creates a 1-child continuation).
 //
-// Functions without PARALLEL annotations (like flow) that still need a
-// sub-call use CALL instead of SPLIT, creating a 1-child continuation.
+// A Continuation stores which joiner to call, how many children remain,
+// where to send the result, and slots for child values. When the last
+// child delivers its VALUE, the joiner fires.
 //
-// Each function also has a seq_<name> variant: the original recursive
-// function compiled directly for single-thread execution. During the WORK
-// phase, tasks call seq_* to run the subtree to completion.
+// How the Runtime Works: SEED / GROW / WORK
+// -----------------------------------------
 //
-// ==========================================================================
-// HOW THE RUNTIME WORKS: SEED / GROW / WORK
-// ==========================================================================
+// The runtime maintains a task matrix of NUM_BLOCKS × BLOCK_SIZE slots.
+// Execution repeats three phases:
 //
-// The runtime maintains a "task matrix" of NUM_BLOCKS × BLOCK_SIZE slots.
-// Execution proceeds in three repeating phases:
+//   SEED (1 block): Starting from ≤ NUM_BLOCKS tasks, iteratively split.
+//     Each SPLIT doubles the count. After ~log2(NUM_BLOCKS) rounds we
+//     have one task per GPU block.
 //
-//   SEED  (1 block)
-//     Starting from ≤ NUM_BLOCKS tasks, iteratively split them. Each SPLIT
-//     doubles the count. After ~log2(NUM_BLOCKS) rounds, we have one task
-//     per GPU block.
+//   GROW (all blocks): Each block takes its tasks and splits them in
+//     shared memory until it has BLOCK_SIZE tasks. Now the full matrix
+//     is populated.
 //
-//   GROW  (all blocks)
-//     Each block takes its task(s) and splits them in shared memory,
-//     doubling each round until BLOCK_SIZE tasks fill the column.
-//     Now all NUM_BLOCKS × BLOCK_SIZE slots are populated.
+//   WORK (all blocks): Every thread runs its task sequentially via seq_*.
+//     The resulting VALUE resolves continuations — writing to parent
+//     slots, firing joiners, collecting new tasks for the next round.
 //
-//   WORK  (all blocks)
-//     Every thread executes its task sequentially (calling seq_*). The
-//     resulting VALUE feeds into continuation resolution: the value is
-//     written to the parent continuation's slot, and if the continuation
-//     is now complete, its join function fires. New tasks (from SPLIT/CALL)
-//     are collected for the next round.
+// Runs as a single cooperative kernel with grid.sync() between phases.
+// No host sync, no queues, no work stealing.
 //
-// This runs as a single cooperative kernel with grid.sync() between phases.
-// No host synchronization, no global queues, no work stealing.
+// The sequential cutoff emerges naturally: 128 blocks × 256 threads means
+// 7 + 8 = 15 doublings, so sort(20) bottoms out at sort(5) — each thread
+// sorts a 32-element subtree.
 //
-// The sequential cutoff emerges naturally: with 128 blocks × 256 threads,
-// SEED uses 7 doublings and GROW uses 8, so sort(20) bottoms out at
-// sort(5) — each thread sorts a 32-element subtree sequentially.
+// Memory
+// ------
 //
-// ==========================================================================
-// MEMORY
-// ==========================================================================
-//
-// Trees live on a flat heap of u64 values. A Node at index i stores its
-// left child at heap[i] and right child at heap[i+1].
-//
-// The heap is split into equal per-thread slices. Each thread bumps a local
-// pointer — zero contention, zero atomics.
+// Trees live on a flat u64 heap. A Node at index i stores left at heap[i],
+// right at heap[i+1]. The heap is split into equal per-thread slices —
+// each thread bumps a local pointer, zero contention.
 //
 // Continuations use a separate buffer with a chunked bump allocator.
-//
-// ==========================================================================
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -133,9 +117,8 @@ typedef unsigned long long u64;
 typedef unsigned int       u32;
 typedef unsigned short     u16;
 
-// ==========================================================================
 // Configuration
-// ==========================================================================
+// -------------
 
 #define NUM_BLOCKS 128
 #define BLOCK_SIZE 256
@@ -146,62 +129,49 @@ typedef unsigned short     u16;
 
 // #define DEBUG_MATRIX
 
-// ==========================================================================
 // Tree Encoding
-// ==========================================================================
+// -------------
 //
-// A Tree is a u64 with bit 63 as the tag:
-//   Leaf: bit 63 = 0, bits [31:0] = value
-//   Node: bit 63 = 1, bits [30:0] = heap index
+// A Tree is a u64. Bit 63 is the tag:
+//   Leaf: bit 63 = 0, bits [31:0] = value.
+//   Node: bit 63 = 1, bits [30:0] = heap index.
 
 #define NODE_TAG (1ULL << 63)
 
-__host__ __device__ inline u64  make_leaf(u32 val)  { return (u64)val; }
-__host__ __device__ inline u64  make_node(u32 idx)  { return NODE_TAG | (u64)idx; }
-__host__ __device__ inline bool is_node(u64 t)      { return (t & NODE_TAG) != 0; }
-__host__ __device__ inline bool is_leaf(u64 t)      { return !is_node(t); }
-__host__ __device__ inline u32  get_val(u64 t)      { return (u32)(t & 0xFFFFFFFFu); }
-__host__ __device__ inline u32  get_idx(u64 t)      { return (u32)(t & 0x7FFFFFFFu); }
+__host__ __device__ inline u64  make_leaf(u32 val) { return (u64)val; }
+__host__ __device__ inline u64  make_node(u32 idx) { return NODE_TAG | (u64)idx; }
+__host__ __device__ inline bool is_node(u64 t)     { return (t & NODE_TAG) != 0; }
+__host__ __device__ inline bool is_leaf(u64 t)     { return !is_node(t); }
+__host__ __device__ inline u32  get_val(u64 t)     { return (u32)(t & 0xFFFFFFFFu); }
+__host__ __device__ inline u32  get_idx(u64 t)     { return (u32)(t & 0x7FFFFFFFu); }
 
-// ==========================================================================
-// Runtime Data Structures
-// ==========================================================================
+// Runtime Structures
+// ------------------
 
-// Result tags: what a task function returns.
 #define R_VALUE 0
 #define R_SPLIT 1
 #define R_CALL  2
-
-// Special return address for the root computation.
 #define ROOT_RET 0xFFFFFFFFu
 
-// A Task: a deferred function call.
-//   fn:   function ID
-//   ret:  encoded return address (continuation index << 1 | slot)
-//   args: up to 3 u64 arguments
+// Task: a deferred function call.
 struct Task {
-  u32 fn;
-  u32 ret;
-  u64 args[3];
+  u32 fn;      // function ID
+  u32 ret;     // return address (continuation index << 1 | slot)
+  u64 args[3]; // arguments (interpretation depends on fn)
 };
 
-// A Cont: a suspended function waiting for 1 or 2 child results.
-//   pend:  number of children still pending (decremented atomically)
-//   ret:   where this cont's result goes
-//   fn:    which join function to call when ready
-//   a0,a1: saved small arguments (e.g. depth, side)
-//   slots: child results written here as they arrive
+// Cont: suspended computation waiting for 1-2 child results.
 struct Cont {
-  u32 pend;
-  u32 ret;
-  u16 fn;
-  u16 a0;
-  u16 a1;
+  u32 pend;    // children still pending (decremented atomically)
+  u32 ret;     // where this cont's result goes
+  u16 fn;      // which joiner to call when ready
+  u16 a0;      // saved argument (e.g. depth)
+  u16 a1;      // saved argument (e.g. side)
   u16 _pad;
-  u64 slots[2];
+  u64 slots[2]; // child results land here
 };
 
-// A Result: returned by task/continuation functions.
+// Result: what a task/continuation function returns.
 struct Result {
   u32  tag;
   u64  val;
@@ -209,7 +179,7 @@ struct Result {
   Task t1;
 };
 
-// All GPU state.
+// All GPU-side state.
 struct State {
   u64  *heap;
   u32  *heap_ptrs;
@@ -223,16 +193,12 @@ struct State {
   u64  *result;
 };
 
-// ==========================================================================
 // Device Helpers
-// ==========================================================================
+// --------------
 
-__host__ __device__ inline u64 pack(u32 lo, u32 hi) {
-  return (u64)lo | ((u64)hi << 32);
-}
-
-__host__ __device__ inline u32 lo(u64 p) { return (u32)p; }
-__host__ __device__ inline u32 hi(u64 p) { return (u32)(p >> 32); }
+__host__ __device__ inline u64 pack(u32 lo, u32 hi) { return (u64)lo | ((u64)hi << 32); }
+__host__ __device__ inline u32 lo(u64 p)             { return (u32)p; }
+__host__ __device__ inline u32 hi(u64 p)             { return (u32)(p >> 32); }
 
 __device__ inline u32 alloc_node(u64 l, u64 r, u64 *H, u32 &hp) {
   u32 i = hp;
@@ -242,9 +208,7 @@ __device__ inline u32 alloc_node(u64 l, u64 r, u64 *H, u32 &hp) {
   return i;
 }
 
-__device__ inline u32 enc_ret(u32 ci, u32 slot) {
-  return (ci << 1) | slot;
-}
+__device__ inline u32 enc_ret(u32 ci, u32 slot) { return (ci << 1) | slot; }
 
 __host__ __device__ inline Task make_task(u32 fn, u32 ret, u64 a0, u64 a1 = 0, u64 a2 = 0) {
   Task t;
@@ -305,55 +269,38 @@ inline void cuda_check(cudaError_t err, const char *file, int line) {
 }
 #define CHK(x) cuda_check((x), __FILE__, __LINE__)
 
-// ==========================================================================
-// ==========================================================================
+// Compiled Functions
+// ==================
 //
-//    ██████  ██████  ███    ███ ██████  ██ ██      ███████ ██████
-//   ██      ██    ██ ████  ████ ██   ██ ██ ██      ██      ██   ██
-//   ██      ██    ██ ██ ████ ██ ██████  ██ ██      █████   ██   ██
-//   ██      ██    ██ ██  ██  ██ ██      ██ ██      ██      ██   ██
-//    ██████  ██████  ██      ██ ██      ██ ███████ ███████ ██████
+// Everything in this section is algorithm-specific. The runtime below is
+// fully generic — it calls into this section only through dispatch_split,
+// dispatch_cont, and dispatch_seq. A compiler would generate this section
+// automatically from the annotated source.
 //
-//   ███████ ██    ██ ███    ██  ██████ ████████ ██  ██████  ███    ██ ███████
-//   ██      ██    ██ ████   ██ ██         ██    ██ ██    ██ ████   ██ ██
-//   █████   ██    ██ ██ ██  ██ ██         ██    ██ ██    ██ ██ ██  ██ ███████
-//   ██      ██    ██ ██  ██ ██ ██         ██    ██ ██    ██ ██  ██ ██      ██
-//   ██       ██████  ██   ████  ██████    ██    ██  ██████  ██   ████ ███████
-//
-// ==========================================================================
-// ==========================================================================
-//
-// This section contains ALL algorithm-specific code. Everything above and
-// below is generic runtime infrastructure that works with ANY set of
-// recursive functions. A compiler would generate this section automatically.
-//
-// For each original function with a PARALLEL annotation, we produce:
-//   seq_<name>    — direct recursive implementation (for WORK phase)
-//   par_<name>_0  — splitter: returns SPLIT/CALL/VALUE (for SEED/GROW)
-//   par_<name>_1  — joiner: continuation handler (for WORK resolution)
-//
-// Function IDs must be consecutive integers starting at 0.
-// ==========================================================================
+// For each function with a PARALLEL annotation:
+//   seq_<name>     Sequential recursive version (WORK phase).
+//   par_<name>_0   Splitter: returns SPLIT/CALL/VALUE (SEED/GROW phases).
+//   par_<name>_1   Joiner: continuation handler (WORK resolution).
 
-// -- Function IDs --
+// Function IDs
+// ............
 
-#define FN_GEN      0
-#define FN_GEN_J    1
-#define FN_SORT     2
-#define FN_SORT_C   3
-#define FN_FLOW     4
-#define FN_FLOW_A   5
-#define FN_FLOW_J   6
-#define FN_SWAP     7
-#define FN_SWAP_J   8
-#define FN_CSUM     9
-#define FN_CSUM_J   10
+#define FN_GEN    0
+#define FN_GEN_J  1
+#define FN_SORT   2
+#define FN_SORT_C 3
+#define FN_FLOW   4
+#define FN_FLOW_A 5
+#define FN_FLOW_J 6
+#define FN_SWAP   7
+#define FN_SWAP_J 8
+#define FN_CSUM   9
+#define FN_CSUM_J 10
 
-// --------------------------------------------------------------------------
 // gen(d, x)
-//   if d == 0: Leaf(x)
-//   else: Node(gen(d-1, x*2+1), gen(d-1, x*2))   // PARALLEL
-// --------------------------------------------------------------------------
+// .........
+//
+// Generates a binary tree with leaves labeled by position.
 
 __device__ u64 seq_gen(u32 d, u32 x, u64 *H, u32 &hp) {
   if (d == 0) {
@@ -380,13 +327,10 @@ __device__ Result par_gen_1(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &lp
   return make_value(make_node(alloc_node(co->slots[0], co->slots[1], H, hp)));
 }
 
-// --------------------------------------------------------------------------
 // sort(d, s, t)
-//   if d == 0 or is_leaf(t): return t
-//   l = sort(d-1, 0, left(t))    // PARALLEL
-//   r = sort(d-1, 1, right(t))   // PARALLEL
-//   return flow(d, s, Node(l, r))
-// --------------------------------------------------------------------------
+// .............
+//
+// Recursively sorts both halves, then merges via flow.
 
 __device__ u64 seq_flow(u32 d, u32 s, u64 t, u64 *H, u32 &hp);
 
@@ -396,8 +340,8 @@ __device__ u64 seq_sort(u32 d, u32 s, u64 t, u64 *H, u32 &hp) {
   }
   u64 l = seq_sort(d - 1, 0, H[get_idx(t)], H, hp);
   u64 r = seq_sort(d - 1, 1, H[get_idx(t) + 1], H, hp);
-  u64 node = make_node(alloc_node(l, r, H, hp));
-  return seq_flow(d, s, node, H, hp);
+  u64 nd = make_node(alloc_node(l, r, H, hp));
+  return seq_flow(d, s, nd, H, hp);
 }
 
 __device__ Result par_sort_0(u32 ret, u64 *args, u64 *H, u32 &hp, Cont *C, u32 ci) {
@@ -415,7 +359,7 @@ __device__ Result par_sort_0(u32 ret, u64 *args, u64 *H, u32 &hp, Cont *C, u32 c
   return make_split(t0, t1);
 }
 
-// sort_cont: both halves sorted → Node(l,r) → flow(d, s, node)
+// sort_cont: both halves sorted → make Node → start flow
 __device__ Result par_sort_1(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &lp, u32 &le) {
   u32 d = co->a0;
   u32 s = co->a1;
@@ -423,25 +367,20 @@ __device__ Result par_sort_1(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &l
   if (d == 0 || is_leaf(t)) {
     return make_value(t);
   }
-  // flow starts with warp, so: CALL swap, then flow_after handles the rest
   u32 ci = alloc_cont(C, cb, lp, le);
   init_cont(&C[ci], 1, co->ret, FN_FLOW_A, (u16)d, (u16)s);
   Task swap = make_task(FN_SWAP, enc_ret(ci, 0), pack(s, d - 1), t);
   return make_call(swap);
 }
 
-// --------------------------------------------------------------------------
 // flow(d, s, t)
-//   if d == 0 or is_leaf(t): return t
-//   w = warp(d-1, s, left(t), right(t))
-//   return down(d, s, w)
+// .............
 //
-// flow has no PARALLEL of its own — it just calls warp then down.
-// But down has a PARALLEL, so flow is compiled as:
-//   par_flow_0: CALL warp, set up flow_after continuation
-//   par_flow_after (flow_a): got warp result → SPLIT into two flows (=down)
-//   par_flow_join (flow_j): got both flow results → Node(l, r)
-// --------------------------------------------------------------------------
+// flow itself has no PARALLEL — it calls warp then down. But down has a
+// PARALLEL, so flow compiles to:
+//   par_flow_0:   CALL warp, continuation → flow_after
+//   flow_after:   got warp result → SPLIT into two sub-flows (= down)
+//   flow_join:    got both sub-flow results → Node(l, r)
 
 __device__ u64 seq_warp(u32 d, u32 s, u64 a, u64 b, u64 *H, u32 &hp);
 
@@ -474,7 +413,7 @@ __device__ Result par_flow_0(u32 ret, u64 *args, u64 *H, u32 &hp, Cont *C, u32 c
   return make_call(swap);
 }
 
-// flow_after: warp done → split into two sub-flows (= down's PARALLEL)
+// flow_after: warp done → split into two sub-flows
 __device__ Result par_flow_after(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &lp, u32 &le) {
   u32 d = co->a0;
   u32 s = co->a1;
@@ -496,20 +435,17 @@ __device__ Result par_flow_join(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32
   return make_value(make_node(alloc_node(co->slots[0], co->slots[1], H, hp)));
 }
 
-// --------------------------------------------------------------------------
-// warp(d, s, a, b)  — called "swap" in the task system
-//   if d == 0: compare-and-swap leaves
-//   l = warp(d-1, s, left(a),  left(b))     // PARALLEL
-//   r = warp(d-1, s, right(a), right(b))    // PARALLEL
-//   return Node(Node(left(l),left(r)), Node(right(l),right(r)))
-// --------------------------------------------------------------------------
+// warp(d, s, a, b)
+// ................
+//
+// Compare-and-swap across two subtrees. Called "swap" in task IDs.
 
 __device__ u64 seq_warp(u32 d, u32 s, u64 a, u64 b, u64 *H, u32 &hp) {
   if (d == 0) {
     u32 va = get_val(a);
     u32 vb = get_val(b);
-    u32 swap = s ^ (va > vb ? 1u : 0u);
-    if (swap == 0) {
+    u32 sw = s ^ (va > vb ? 1u : 0u);
+    if (sw == 0) {
       return make_node(alloc_node(make_leaf(va), make_leaf(vb), H, hp));
     } else {
       return make_node(alloc_node(make_leaf(vb), make_leaf(va), H, hp));
@@ -531,18 +467,16 @@ __device__ Result par_swap_0(u32 ret, u64 *args, u64 *H, u32 &hp, Cont *C, u32 c
   }
   u64 l = H[get_idx(t)];
   u64 r = H[get_idx(t) + 1];
-  // Leaf-leaf base case: direct compare-and-swap
   if (is_leaf(l) && is_leaf(r)) {
     u32 va = get_val(l);
     u32 vb = get_val(r);
-    u32 swap = s ^ (va > vb ? 1u : 0u);
-    if (swap == 0) {
+    u32 sw = s ^ (va > vb ? 1u : 0u);
+    if (sw == 0) {
       return make_value(make_node(alloc_node(make_leaf(va), make_leaf(vb), H, hp)));
     } else {
       return make_value(make_node(alloc_node(make_leaf(vb), make_leaf(va), H, hp)));
     }
   }
-  // Recursive case: pair up children and split
   u32 p0 = alloc_node(H[get_idx(l)], H[get_idx(r)], H, hp);
   u32 p1 = alloc_node(H[get_idx(l) + 1], H[get_idx(r) + 1], H, hp);
   init_cont(&C[ci], 2, ret, FN_SWAP_J, 0, 0);
@@ -551,7 +485,7 @@ __device__ Result par_swap_0(u32 ret, u64 *args, u64 *H, u32 &hp, Cont *C, u32 c
   return make_split(t0, t1);
 }
 
-// swap_join: both halves swapped → reassemble warp structure
+// swap_join: both halves done → reassemble warp structure
 __device__ Result par_swap_1(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &lp, u32 &le) {
   u64 r0 = co->slots[0];
   u64 r1 = co->slots[1];
@@ -560,13 +494,12 @@ __device__ Result par_swap_1(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &l
   return make_value(make_node(alloc_node(make_node(li), make_node(ri), H, hp)));
 }
 
-// --------------------------------------------------------------------------
 // checksum(t, d)
-//   if d == 0: return get_val(t)
-//   l = checksum(left(t), d-1)     // PARALLEL
-//   r = checksum(right(t), d-1)    // PARALLEL
-//   return l * 31^(2^(d-1)) + r
-// --------------------------------------------------------------------------
+// ..............
+//
+// Tree checksum. The original is a sequential fold (result = result*31 + val),
+// but for a balanced tree of known depth we can split: if the left subtree
+// has n leaves, combined = left * 31^n + right.
 
 __device__ u32 pow31(u32 n) {
   u32 r = 1;
@@ -604,11 +537,12 @@ __device__ Result par_csum_1(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &l
   return make_value((u64)(l * pow31(1u << (d - 1)) + r));
 }
 
-// --------------------------------------------------------------------------
-// Dispatch tables: the ONLY place the runtime touches function IDs.
-// --------------------------------------------------------------------------
+// Dispatch Tables
+// ...............
+//
+// The ONLY bridge between compiled functions and the generic runtime.
+// The runtime calls these three functions and nothing else.
 
-// Called during SEED/GROW to split a task.
 __device__ Result dispatch_split(Task &task, u64 *H, u32 &hp, Cont *C, u32 ci) {
   switch (task.fn) {
     case FN_GEN:  return par_gen_0(task.ret, task.args, H, hp, C, ci);
@@ -620,7 +554,6 @@ __device__ Result dispatch_split(Task &task, u64 *H, u32 &hp, Cont *C, u32 ci) {
   }
 }
 
-// Called during WORK to fire a completed continuation.
 __device__ Result dispatch_cont(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &lp, u32 &le) {
   switch (co->fn) {
     case FN_GEN_J:  return par_gen_1(co, H, hp, C, cb, lp, le);
@@ -633,54 +566,36 @@ __device__ Result dispatch_cont(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32
   }
 }
 
-// Called during WORK to execute a task sequentially.
 __device__ u64 dispatch_seq(Task &task, u64 *H, u32 &hp) {
   switch (task.fn) {
     case FN_GEN: {
-      u32 d = lo(task.args[0]);
-      u32 x = hi(task.args[0]);
-      return seq_gen(d, x, H, hp);
+      return seq_gen(lo(task.args[0]), hi(task.args[0]), H, hp);
     }
     case FN_SORT: {
-      u32 d = lo(task.args[0]);
-      u32 s = hi(task.args[0]);
-      return seq_sort(d, s, task.args[1], H, hp);
+      return seq_sort(lo(task.args[0]), hi(task.args[0]), task.args[1], H, hp);
     }
     case FN_FLOW: {
-      u32 d = lo(task.args[0]);
-      u32 s = hi(task.args[0]);
-      return seq_flow(d, s, task.args[1], H, hp);
+      return seq_flow(lo(task.args[0]), hi(task.args[0]), task.args[1], H, hp);
     }
     case FN_SWAP: {
-      u32 s = lo(task.args[0]);
-      u32 d = hi(task.args[0]);
       u64 t = task.args[1];
-      return seq_warp(d, s, H[get_idx(t)], H[get_idx(t) + 1], H, hp);
+      return seq_warp(hi(task.args[0]), lo(task.args[0]), H[get_idx(t)], H[get_idx(t) + 1], H, hp);
     }
     case FN_CSUM: {
-      u32 d = lo(task.args[0]);
-      return seq_csum(task.args[1], d, H);
+      return seq_csum(task.args[1], lo(task.args[0]), H);
     }
     default:
       return 0;
   }
 }
 
-// ==========================================================================
-// ==========================================================================
-//
-//   END OF COMPILED FUNCTIONS — everything below is generic runtime.
-//
-// ==========================================================================
-// ==========================================================================
+// End of compiled functions — everything below is generic runtime.
 
-// ==========================================================================
 // Value Resolution
-// ==========================================================================
+// ================
 //
-// When a VALUE is produced, deliver it to the parent continuation. If the
-// continuation becomes complete (pending == 0), fire it. The result may
-// cascade upward (another VALUE) or produce new tasks (SPLIT/CALL).
+// When a VALUE is produced, deliver it to the parent continuation. If
+// pending hits zero, fire the joiner. Results may cascade upward.
 
 __device__ void resolve(u32 ret, u64 val, u64 *H, u32 &hp, Cont *C, u32 &lp, u32 &le, u32 *cb, Task *out, u32 *out_n, u32 *done, u64 *result) {
   for (;;) {
@@ -703,7 +618,6 @@ __device__ void resolve(u32 ret, u64 val, u64 *H, u32 &hp, Cont *C, u32 &lp, u32
       return;
     }
 
-    // We were the last child — fire the continuation.
     __threadfence();
     Result r = dispatch_cont(co, H, hp, C, cb, lp, le);
 
@@ -727,26 +641,24 @@ __device__ void resolve(u32 ret, u64 val, u64 *H, u32 &hp, Cont *C, u32 &lp, u32
   }
 }
 
-// ==========================================================================
 // Debug Visualization
-// ==========================================================================
+// ===================
 
 #ifdef DEBUG_MATRIX
 __device__ const char *shade(u32 n) {
-  if (n == 0)                    { return " "; }
-  if (n <= (u32)(BLOCK_SIZE / 4))  { return "░"; }
-  if (n <= (u32)(BLOCK_SIZE / 2))  { return "▒"; }
+  if (n == 0)                         { return " "; }
+  if (n <= (u32)(BLOCK_SIZE / 4))     { return "░"; }
+  if (n <= (u32)(BLOCK_SIZE / 2))     { return "▒"; }
   if (n <= (u32)(BLOCK_SIZE * 3 / 4)) { return "▓"; }
   return "█";
 }
 #endif
 
-// ==========================================================================
 // Evaluator Kernel
-// ==========================================================================
+// ================
 //
-// Single persistent cooperative kernel. Loops SEED → GROW → WORK until the
-// root computation is complete. grid.sync() separates phases.
+// Single persistent cooperative kernel. Loops SEED → GROW → WORK until
+// the root computation completes. grid.sync() separates phases.
 
 __global__ void evaluator(State S) {
   cg::grid_group grid = cg::this_grid();
@@ -770,7 +682,11 @@ __global__ void evaluator(State S) {
       return;
     }
 
-    // ── SEED ─────────────────────────────────────────────────────────
+    // SEED
+    // ----
+    // Block 0 iteratively splits ≤ NUM_BLOCKS tasks until we have one per
+    // block. Other blocks wait at the grid.sync() below.
+
     if (fc <= (u32)NUM_BLOCKS) {
       if (bid == 0) {
         if (tid < fc) {
@@ -840,7 +756,11 @@ __global__ void evaluator(State S) {
       }
     }
 
-    // ── GROW ─────────────────────────────────────────────────────────
+    // GROW
+    // ----
+    // Each block loads its share of the flat buffer and iteratively splits
+    // until it has BLOCK_SIZE tasks. Results go to the task matrix.
+
     {
       u32 per = fc / NUM_BLOCKS;
       u32 extra = fc % NUM_BLOCKS;
@@ -913,7 +833,12 @@ __global__ void evaluator(State S) {
     }
     grid.sync();
 
-    // ── WORK ─────────────────────────────────────────────────────────
+    // WORK
+    // ----
+    // Each thread runs its task sequentially, then resolves continuations.
+    // New tasks from fired continuations go to the flat buffer for the
+    // next round.
+
     {
       if (tid == 0) {
         out_n = 0;
@@ -961,9 +886,11 @@ __global__ void evaluator(State S) {
   }
 }
 
-// ==========================================================================
-// Host: launch one top-level task through the evaluator
-// ==========================================================================
+// Host
+// ====
+
+// Launch one top-level task through the evaluator. Resets state, places
+// the task, and runs the cooperative kernel to completion.
 
 static void run(State &S, u32 fn, u64 a0, u64 a1, float *ms) {
   u32 zero = 0;
@@ -996,10 +923,6 @@ static void run(State &S, u32 fn, u64 a0, u64 a1, float *ms) {
   CHK(cudaEventDestroy(t1));
 }
 
-// ==========================================================================
-// Main
-// ==========================================================================
-
 int main(int argc, char **argv) {
   int depth = 20;
   if (argc > 1) {
@@ -1015,7 +938,7 @@ int main(int argc, char **argv) {
 
   CHK(cudaDeviceSetLimit(cudaLimitStackSize, 8192));
 
-  // -- Allocate all GPU memory in one call --
+  // Allocate all GPU memory in one call.
   #define ALIGN(x) (((x) + 255) & ~(size_t)255)
   size_t off = 0;
   size_t p_heap = off; off += ALIGN((size_t)HEAP_SIZE * 8);
@@ -1045,7 +968,7 @@ int main(int argc, char **argv) {
   S.done      = (u32  *)(mem + p_done);
   S.result    = (u64  *)(mem + p_res);
 
-  // -- Per-slot heap slices --
+  // Per-slot heap slices.
   u32 slice = HEAP_SIZE / NUM_SLOTS;
   u32 *hps = (u32 *)malloc(NUM_SLOTS * sizeof(u32));
   for (int i = 0; i < NUM_SLOTS; i++) {
@@ -1054,7 +977,7 @@ int main(int argc, char **argv) {
   CHK(cudaMemcpy(S.heap_ptrs, hps, NUM_SLOTS * sizeof(u32), cudaMemcpyHostToDevice));
   free(hps);
 
-  // -- Run: gen → sort → checksum --
+  // Run: gen → sort → checksum.
   float ms;
   u64 tree, sorted, cksum;
 
