@@ -1,3 +1,310 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// CRITICAL: THIS IS A COMPILER RUNTIME, NOT A ONE-OFF PROGRAM
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The bitonic sort example is a TEST CASE for a general-purpose parallel
+// evaluator. The end product is a COMPILER that auto-generates task
+// functions (like fn_sort, fn_flow, fn_swap, etc.) from arbitrary Bend
+// programs. Therefore:
+//
+// - DO NOT optimize by changing the algorithm's function signatures,
+//   node structures, or recursive decomposition. Those are fixed by the
+//   source language and the compiler will emit them mechanically.
+//   e.g. changing swap(s,t) to warp(d,s,a,b) "saves wrapper nodes" but
+//   that optimization can never be applied by a general compiler — it
+//   requires understanding the specific semantics of warp. Wasted time.
+//
+// - DO optimize the RUNTIME: task scheduling, continuation management,
+//   heap allocation, work distribution, idle handling, memory layout.
+//   These improvements apply to ALL compiled programs, not just bitonic.
+//
+// - The sequential cutoff (SEQ_CUTOFF) is a runtime optimization: it
+//   executes the SAME algorithm on a single thread instead of splitting
+//   into tasks. This is legal because the compiler can emit both the
+//   task version and a sequential version of each function.
+//
+// - A "depth hint" in task args (like swap's depth_hint) is metadata
+//   the compiler can trivially emit. It doesn't change the algorithm.
+//
+// Summary: optimize the RUNTIME (scheduler, allocator, queues), not
+// the ALGORITHM (function bodies, data representation, recursion shape).
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CURRENT STATUS & PROFILING DATA (2026-04-04)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// PERFORMANCE SUMMARY
+// ===================
+//  GPU: RTX 4090 (128 SMs, 24 GB, Ada/sm_89, ~1 TB/s DRAM, ~2.5 GHz)
+//  Test: sort(20, 0, gen(20, 0)) — 1M elements, checksum 4027056128
+//
+//  C reference (gcc -O2, single-threaded):  ~2500 ms
+//  GPU current best (64 blocks, mask=127):   ~167 ms  (15x)
+//  GPU committed config (768 blocks, mask=511): ~196 ms  (12.6x)
+//
+//  Target: 125 ms (20x)
+//
+// COMPILATION NOTES
+// =================
+//  - Default nvcc (no -arch flag) compiles for sm_52 PTX, then the
+//    driver JIT-compiles to sm_89 native code at launch time.
+//  - The JIT produces BETTER code than -arch=sm_89 static compilation!
+//    sm_52 JIT: ~196ms.  sm_89 static: ~270ms.  Reason: the JIT
+//    optimizes the recursive device functions (d_sort/d_flow/d_warp/
+//    d_down) with less register spilling (68 bytes vs 84 bytes).
+//  - Always compile WITHOUT -arch flag for best performance.
+//  - Compile flags: nvcc -O3 -use_fast_math -o bitonic_gpu bitonic.cu
+//
+// HARDWARE PROFILING (ncu on RTX 4090)
+// ====================================
+//
+//  Occupancy
+//  ---------
+//  Registers per thread: 130 (after JIT)
+//  With 256-thread blocks: 130 * 256 = 33,280 regs per block
+//  Max per SM: 65,536 → only 1 block per SM
+//  Active warps: 8 out of max 48 → 16.67% occupancy
+//  NOTE: need ≤128 regs for 2 blocks/SM (33% occupancy)
+//        we are just 2 registers over the threshold!
+//
+//  Throughput utilization
+//  ---------------------
+//  DRAM throughput:   3.98% of peak (~40 GB/s of 1 TB/s)
+//  L2 throughput:    32.67% of peak
+//  L1 throughput:    15.34% of peak
+//  SM compute:     11.98% of peak
+//  → GPU is massively underutilized. Not bandwidth-bound.
+//    The bottleneck is MEMORY LATENCY with too few warps to hide it.
+//
+//  Stall analysis
+//  --------------
+//  Long scoreboard (memory wait): 21.79× per instruction issued ← DOMINANT
+//  Wait (barriers):         2.84×
+//  Membar (__threadfence):     0.36×
+//  Short scoreboard (ALU):     0.34×
+//  → 97% of stalls are waiting for global memory loads.
+//    With 8 warps per SM and ~22 cycles of stall per instruction,
+//    the SM needs ~22 warps to stay busy. We have 8. The SM is
+//    effectively idle ~64% of the time.
+//
+//  Cache hierarchy
+//  ---------------
+//  L1 hit: 170.85 GB   L1 miss: 82.75 GB   → 67.4% hit rate
+//  L2 hit: 2.83B reqs   L2 miss: 216M reqs  → 92.9% hit rate
+//  DRAM read: 1.41 GB   DRAM write: 7.53 GB
+//  → Caching works well. Most data served from L1/L2.
+//    But the 216M DRAM misses at ~500 cycles each dominate runtime.
+//
+//  Instruction mix
+//  ---------------
+//  Total instructions: 21.2 billion
+//  ALU: 6.0B (28%)  FMA: 3.5B (17%)  LSU: 4.3B (20%)  Other: 7.4B (35%)
+//
+// TASK PROFILING (instrumented kernel, depth 20)
+// ==============================================
+//
+//  Task breakdown (15.5M total tasks)
+//  ----------------------------------
+//   sort:            131,071  ( 0.8%)  — bulk sequential work via d_sort(4)
+//   flow:           1,966,082  (12.7%)
+//   swap:           7,929,855  (51.1%)  ← dominant task type
+//   sort_cont:        65,535  ( 0.4%)
+//   flow_after_swap:    983,041  ( 6.3%)
+//   flow_join:        983,041  ( 6.3%)
+//   swap_join:       3,473,407  (22.4%)
+//
+//   73.5% of all tasks are swap-related (swap + swap_join)
+//   Each swap task does minimal work: read 4 heap entries, create 2
+//   wrapper nodes, allocate 1 continuation, then SPLIT. Very high
+//   overhead-to-work ratio compared to sort tasks (which call d_sort(4)
+//   doing ~1100 operations).
+//
+//  Result types
+//  ------------
+//   VALUE: 10,027,008 (64.6%)  — immediate results
+//   SPLIT:  4,521,983 (29.1%)  — binary splits → push one child
+//   CALL:    983,041  (6.3%)  — tail calls (flow→swap)
+//
+//  Task sourcing (how threads get their next task)
+//  -----------------------------------------------
+//   Initial + SPLIT-keep + CALL-chain: 5,505,025 (35.4%)
+//   Continuation saturation:      5,505,024 (35.4%)
+//   Mailbox receive:          4,200,195 (27.0%)
+//   Global queue:             321,788  (2.1%)
+//
+//   70.8% of tasks stay on the same thread (keep-half-of-split +
+//   cont-saturation). Only 29.1% get pushed to other threads.
+//   This creates long sequential chains on individual threads.
+//
+//  Push distance distribution (4.5M pushes)
+//  -----------------------------------------
+//   XOR dist 1:   1.96M (43.4%)  — nearest neighbor
+//   XOR dist 2:    731K (16.2%)
+//   XOR dist 4:    457K (10.1%)
+//   XOR dist 8-128: 1.05M (23.3%)
+//   Global queue:   322K  (7.1%)  — overflow
+//   → XOR probing works well. 93% of pushes land within the block.
+//
+// BLOCK COUNT: THE CRITICAL FINDING
+// =================================
+//
+//  With 768 blocks (current committed config):
+//   - 69% of threads execute ZERO tasks
+//   - 66.7% of WARPS are fully idle (0 threads active)
+//   - 75% of BLOCKS have zero total work
+//   - median tasks/thread = 0, max = 5286
+//   - Only ~192 blocks (25%) actually participate
+//
+//  Root cause: with 130 regs/thread, only 1 block/SM fits.
+//  128 SMs → 128 resident blocks. The other 640 blocks cycle in and
+//  out but miss the work window. Tasks get distributed to resident
+//  blocks via mailbox; non-resident blocks never see them.
+//
+//  With 64 blocks (all guaranteed resident, using 64 of 128 SMs):
+//   - 0% idle threads (all 16,384 participate)
+//   - min=22, median=794, max=5197 tasks/thread
+//   - 167ms (15% faster than 768 blocks)
+//
+//  The optimal block count is 48-64 with IDLE_POLL_MASK=63-255.
+//  Going below 64 (e.g., 32) uses too few SMs and hurts.
+//  Going above 128 wastes blocks that never get work.
+//
+//  Block count sweep (depth 20, SEQ_CUTOFF=4):
+//   32 blocks:  ~176ms
+//   48 blocks:  ~167ms
+//   64 blocks:  ~165ms  ← sweet spot
+//   96 blocks:  ~188ms
+//   128 blocks:  ~195ms
+//   256 blocks:  ~193ms
+//   768 blocks:  ~196ms
+//
+// SEQ_CUTOFF SWEEP (tested with both 768 and 64 blocks)
+// =====================================================
+//  Cutoff 3:  12.3M conts,  ~1020ms  (too many conts)
+//  Cutoff 4:  5.5M conts,  ~167ms  ← optimal
+//  Cutoff 5:  2.5M conts,  ~970ms  (too few parallel tasks)
+//  Cutoff 6:  1.1M conts, ~1650ms
+//  Cutoff 7:  479K conts, ~2600ms
+//  Cutoff 8:  209K conts, ~4650ms
+//
+//  Cutoff 4 creates 2^16 = 65,536 sort tasks (one per subtree of
+//  depth 4). Each d_sort(4) processes 16 elements with ~1100 memory
+//  ops. Lower cutoffs create exponentially more continuations;
+//  higher cutoffs starve the GPU of parallel tasks.
+//
+// IDLE_POLL_MASK SWEEP (how often idle threads check global queue)
+// ===============================================================
+//  mask=15  (every 16 spins):   ~815ms — severe contention
+//  mask=63  (every 64 spins):   ~530ms
+//  mask=127 (every 128 spins):  ~200ms
+//  mask=255 (every 256 spins):  ~180ms
+//  mask=511 (every 512 spins):  ~196ms ← committed
+//  mask=1023:            ~195ms
+//  mask=4095:            ~195ms
+//
+//  Low masks cause atomicCAS contention on global queue head.
+//  The optimal mask depends on block count: fewer blocks can
+//  tolerate lower masks. With 64 blocks, mask=63-255 is best.
+//
+// REGISTER PRESSURE EXPERIMENTS
+// ============================
+//  --maxrregcount=80:  80 regs,  3 blocks/SM, ~680ms  (heavy spilling)
+//  --maxrregcount=96:  96 regs,  2 blocks/SM, ~310ms  (moderate spilling)
+//  --maxrregcount=112: 112 regs, 2 blocks/SM, ~285ms
+//  --maxrregcount=126: 126 regs, 2 blocks/SM, ~310ms
+//  --maxrregcount=128: 128 regs, 2 blocks/SM, ~330ms
+//  no limit:      130 regs, 1 block/SM, ~196ms  ← best
+//
+//  IMPORTANT: forcing lower register counts via compiler flags causes
+//  spill stores/loads to local memory (backed by same global memory
+//  we're already bottlenecked on). The spill traffic OVERWHELMS the
+//  occupancy benefit. Must reduce registers through CODE RESTRUCTURING
+//  (eliminating live variables) rather than compiler flags.
+//
+//  Register budget breakdown (estimated):
+//   Result struct (returned by task fns):  ~23 regs (2 Tasks + tag + value)
+//   GState pointers (12 × 64-bit ptrs):   ~24 regs
+//   Task my_task (fn + ret + 4 args):    ~10 regs
+//   Kernel loop locals (lp, le, tid, etc):  ~8 regs
+//   Task function locals:          ~65 regs
+//   Total:                ~130 regs
+//
+//  Savings needed: 2 registers (130 → 128) for 2 blocks/SM.
+//  Potential savings:
+//   - Eliminate Result struct (push 2nd task directly): ~15-20 regs
+//   - Pack GState into single allocation + offsets:   ~20 regs
+//   - Store GState base in shared memory:        ~2 regs
+//  Any ONE of these would be sufficient. Combined: ~35 regs saved.
+//
+// DEPTH SCALING (GPU vs C)
+// =======================
+//  depth 10:  C=  1ms  GPU=  5.5ms  0.2x (GPU overhead dominates)
+//  depth 12:  C=  4ms  GPU= 15.1ms  0.3x
+//  depth 14:  C= 21ms  GPU= 34.8ms  0.6x
+//  depth 16:  C= 98ms  GPU= 75.3ms  1.3x (crossover)
+//  depth 18:  C=489ms  GPU=120.0ms  4.1x
+//  depth 20:  C=2477ms  GPU=167.0ms  14.8x
+//
+//  GPU overhead is ~5ms baseline. Speedup improves with depth because
+//  the parallelism (2^depth independent sort tasks) grows while the
+//  per-task sequential work (d_sort(4) = fixed) stays constant.
+//
+// TIME BREAKDOWN (estimated for 167ms kernel)
+// ============================================
+//  Memory stalls:  ~120ms (72%)  — 216M DRAM misses + L2 latency
+//  Task overhead:   ~20ms (12%)  — atomics, cont alloc, mailbox
+//  Useful compute:  ~15ms  (9%)  — ALU/FMA instructions
+//  Idle spinning:   ~12ms  (7%)  — threads waiting for work
+//
+// OPTIMIZATION ROADMAP (runtime-only, no algorithm changes)
+// =========================================================
+//
+//  1. DONE: Sequential cutoff (SEQ_CUTOFF=4)
+//     Reduced conts from ~131M to 5.5M. Massive win.
+//
+//  2. DONE: Idle poll frequency tuning (mask=511)
+//     Reduced global queue contention. 2x win from mask=15.
+//
+//  3. TODO: Reduce block count to 64
+//     All blocks guaranteed resident. 15% win.
+//     Update: also adjust IDLE_POLL_MASK to 127 (fewer threads
+//     → less contention → can poll more aggressively).
+//
+//  4. TODO: Reduce register pressure to ≤128 (highest impact)
+//     Enables 2 blocks/SM = 16 warps = 2× latency hiding.
+//     Must be done via code restructuring, NOT compiler flags.
+//     Options:
+//      a) Eliminate Result struct: task functions push 2nd task
+//        directly and overwrite my_task in place.
+//      b) Pack GState into single contiguous allocation with
+//        compile-time offsets from a base pointer.
+//      c) Store frequently-used pointers in shared memory.
+//     Expected impact: ~1.5-2× → ~85-110ms (23-29× vs C)
+//
+//  5. TODO: Per-block page allocation (as designed in AGENTS.md)
+//     Block collectively grabs heap pages; threads bump locally.
+//     Improves data locality (parent-child nodes on same page)
+//     and reduces global atomicAdds from 3.2M to ~12K.
+//
+//  6. MAYBE: Shared-memory work queue per block
+//     Replace global-memory mailbox with shared-memory ring buffer.
+//     Pro: ~10× faster push/pop (shared vs global atomics).
+//     Con: uses shared memory (but only ~2-4 KB).
+//     With good occupancy from (4), this becomes more attractive
+//     since shared memory pressure is the limiting factor.
+//
+// THINGS THAT DON'T WORK (tried and measured)
+// ===========================================
+//  - u32 tree encoding: 3× slower (implementation issues, not fundamental)
+//  - -arch=sm_89: 35% slower than JIT from sm_52 (worse spilling)
+//  - Increasing SWAP_SEQ_CUTOFF beyond 4: makes swap sequential on one
+//    thread, which is catastrophically slow for deep swaps (10-13 seconds
+//    for cutoff=16-19). The swap MUST be parallelized through the task system.
+//  - ALLOC_CHUNK=64: slightly slower than 256 (more atomic contention)
+//  - ALLOC_CHUNK=512: similar to 256 (diminishing returns)
+//  - Aggressive idle polling (mask=7): 2× slower (atomic contention)
+
 // Our goal is to implement a general-purpose parallel evaluator for a pure
 // functional language in CUDA. In order to start our work, we designed the
 // bitonic sort algorithm above, which serves as an initial example. We'll start

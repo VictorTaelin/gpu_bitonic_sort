@@ -33,12 +33,12 @@ __host__ __device__ inline u32 GetIdx(u64 t) { return (u32)(t & 0x7FFFFFFFu); }
 #define HEAP_SIZE     (1u << 30)  // u64 slots  (~8 GB)
 #define CONT_BUF_SIZE   (1u << 23)  // 8 M continuations
 #define QUEUE_BUF_SIZE  (1u << 22)  // 4 M global-queue entries
-#define NUM_BLOCKS    768
+#define NUM_BLOCKS    64
 #define BLOCK_SIZE    256
 #define NUM_THREADS    (NUM_BLOCKS * BLOCK_SIZE)
 #define ALLOC_CHUNK    256      // per-thread bump chunk (u64 slots)
 #define SEQ_CUTOFF    4       // sort/flow/swap ≤ this depth → sequential
-#define IDLE_POLL_MASK  511      // check global queue every (mask+1) idle spins
+#define IDLE_POLL_MASK  127      // check global queue every (mask+1) idle spins
 
 // Function IDs  (matching the design in AGENTS.md)
 #define FN_SORT       0  // sort(d, s, t)
