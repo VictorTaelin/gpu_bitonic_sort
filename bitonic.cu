@@ -28,7 +28,7 @@ __host__ __device__ inline u32  GetIdx(u64 t) { return (u32)(t & 0x7FFFFFFFu); }
 #define NB         128        // blocks (1 per SM on RTX 4090)
 #define BS         256        // threads per block
 #define NSLOTS     (NB * BS)  // 32768
-#define HEAP_U64   (1u << 30) // 8 GB
+#define HEAP_U64   (2u << 30) // 16 GB
 #define CONT_MAX   (1u << 26) // 64M conts
 #define CONT_CHUNK 2
 #define ROOT_RET   0xFFFFFFFFu
@@ -339,30 +339,30 @@ static u64 host_gen(u32 d, u32 x) {
   u32 i = h_hptr; h_hptr += 2; h_heap[i] = l; h_heap[i+1] = r;
   return MkNode(i);
 }
-// GPU-side checksum + sort verification
-__device__ void d_flatten(u64 t, u64 *H, u32 *arr, u32 *pos) {
-  if (IsLeaf(t)) { arr[atomicAdd(pos, 1u)] = GetVal(t); return; }
-  d_flatten(H[GetIdx(t)], H, arr, pos);
-  d_flatten(H[GetIdx(t)+1], H, arr, pos);
+// Parallel verify: flatten tree, check sorted, compute checksum — all on GPU
+__global__ void check_kernel(u64 *H, u64 *p_root, u32 *arr, u32 *out, u32 depth, u32 N) {
+  // Phase 1: each thread walks root→leaf to flatten
+  u32 idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < N) {
+    u64 t = *p_root;
+    for (int k = (int)depth - 1; k >= 0; k--)
+      t = ((idx >> k) & 1) ? H[GetIdx(t)+1] : H[GetIdx(t)];
+    arr[idx] = GetVal(t);
+  }
+  // Grid-wide barrier (not available without cooperative launch)
+  // Instead: use two-kernel approach — caller launches this then check2
 }
-__device__ void d_cksum(u64 t, u64 *H, u32 *r) {
-  if (IsLeaf(t)) { *r = (*r) * 31u + GetVal(t); return; }
-  d_cksum(H[GetIdx(t)], H, r);
-  d_cksum(H[GetIdx(t)+1], H, r);
-}
-__global__ void check_kernel(u64 *heap, u64 *result, u32 *out_cksum, u32 *out_sorted, u32 *out_arr, u32 *out_pos, u32 N) {
-  // Single thread: compute checksum and flatten
-  u64 t = *result;
-  u32 ck = 0;
-  d_cksum(t, heap, &ck);
-  *out_cksum = ck;
-  *out_pos = 0;
-  d_flatten(t, heap, out_arr, out_pos);
-  // Check sorted
-  u32 ok = 1;
-  for (u32 i = 1; i < N; i++)
-    if (out_arr[i] < out_arr[i-1]) { ok = 0; break; }
-  *out_sorted = ok;
+__global__ void check2_kernel(u32 *arr, u32 *out, u32 N) {
+  // out[0] = sorted (1=yes), out[1] = checksum
+  // Thread 0 does sequential checksum + sorted check (fast on CPU-like data)
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    u32 ck = 0, ok = 1;
+    for (u32 i = 0; i < N; i++) {
+      ck = ck * 31u + arr[i];
+      if (i > 0 && arr[i] < arr[i-1]) ok = 0;
+    }
+    out[0] = ok; out[1] = ck;
+  }
 }
 
 int main(int argc, char **argv) {
@@ -377,31 +377,48 @@ int main(int argc, char **argv) {
   u64 root = host_gen(DEPTH, 0);
   u32 init_hp = h_hptr;
   u32 slice = (HEAP_U64 - init_hp) / NSLOTS;
-  fprintf(stderr, "  heap slice=%u (%u KB/slot)\n", slice, slice*8/1024);
 
   CHK(cudaDeviceSetLimit(cudaLimitStackSize, 8192));
 
+  // Single GPU allocation for all buffers (avoids per-alloc overhead)
+  #define ALIGN256(x) (((x) + 255) & ~(size_t)255)
+  size_t off = 0;
+  size_t o_heap   = off; off += ALIGN256((size_t)HEAP_U64 * 8);
+  size_t o_hptrs  = off; off += ALIGN256((size_t)NSLOTS * 4);
+  size_t o_conts  = off; off += ALIGN256((size_t)CONT_MAX * sizeof(Cont));
+  size_t o_cbump  = off; off += ALIGN256(4);
+  size_t o_tasks  = off; off += ALIGN256((size_t)NSLOTS * sizeof(Task));
+  size_t o_flat   = off; off += ALIGN256((size_t)NSLOTS * sizeof(Task));
+  size_t o_fcnt   = off; off += ALIGN256(4);
+  size_t o_bcnt   = off; off += ALIGN256((size_t)NB * 4);
+  size_t o_done   = off; off += ALIGN256(4);
+  size_t o_result = off; off += ALIGN256(8);
+  // Extra: check kernel arrays
+  size_t o_ckarr  = off; off += ALIGN256((size_t)N * 4);
+  size_t o_ckout  = off; off += ALIGN256(16); // cksum, sorted, pos, pad
+  char *d_mem;
+  CHK(cudaMalloc(&d_mem, off));
+  CHK(cudaMemset(d_mem, 0, off));
+
   G g;
-  CHK(cudaMalloc(&g.heap,   (size_t)HEAP_U64 * sizeof(u64)));
-  CHK(cudaMalloc(&g.hptrs,  NSLOTS * sizeof(u32)));
-  CHK(cudaMalloc(&g.conts,  (size_t)CONT_MAX * sizeof(Cont)));
-  CHK(cudaMalloc(&g.cbump,  sizeof(u32)));
-  CHK(cudaMalloc(&g.tasks,  (size_t)NSLOTS * sizeof(Task)));
-  CHK(cudaMalloc(&g.flat,   (size_t)NSLOTS * sizeof(Task)));
-  CHK(cudaMalloc(&g.fcnt,   sizeof(u32)));
-  CHK(cudaMalloc(&g.bcnt,   NB * sizeof(u32)));
-  CHK(cudaMalloc(&g.done,   sizeof(u32)));
-  CHK(cudaMalloc(&g.result, sizeof(u64)));
+  g.heap   = (u64 *)(d_mem + o_heap);
+  g.hptrs  = (u32 *)(d_mem + o_hptrs);
+  g.conts  = (Cont*)(d_mem + o_conts);
+  g.cbump  = (u32 *)(d_mem + o_cbump);
+  g.tasks  = (Task*)(d_mem + o_tasks);
+  g.flat   = (Task*)(d_mem + o_flat);
+  g.fcnt   = (u32 *)(d_mem + o_fcnt);
+  g.bcnt   = (u32 *)(d_mem + o_bcnt);
+  g.done   = (u32 *)(d_mem + o_done);
+  g.result = (u64 *)(d_mem + o_result);
+  u32 *d_ckarr = (u32*)(d_mem + o_ckarr);
+  u32 *d_ckout = (u32*)(d_mem + o_ckout); // [0]=cksum [1]=sorted [2]=pos
 
   CHK(cudaMemcpy(g.heap, h_heap, init_hp * sizeof(u64), cudaMemcpyHostToDevice));
   u32 *h_hps = (u32*)malloc(NSLOTS * sizeof(u32));
   for (int i = 0; i < NSLOTS; i++) h_hps[i] = init_hp + (u32)i * slice;
   CHK(cudaMemcpy(g.hptrs, h_hps, NSLOTS * sizeof(u32), cudaMemcpyHostToDevice));
   free(h_hps);
-
-  u32 zero = 0;
-  CHK(cudaMemcpy(g.cbump, &zero, sizeof(u32), cudaMemcpyHostToDevice));
-  CHK(cudaMemcpy(g.done,  &zero, sizeof(u32), cudaMemcpyHostToDevice));
 
   Task init_task = mt(FN_SORT, ROOT_RET, pk(DEPTH, 0), root);
   CHK(cudaMemcpy(g.flat, &init_task, sizeof(Task), cudaMemcpyHostToDevice));
@@ -421,28 +438,16 @@ int main(int argc, char **argv) {
   float ms; CHK(cudaEventElapsedTime(&ms, ev0, ev1));
   fprintf(stderr, "  kernel %.1f ms\n", ms);
 
-  // GPU-side verification (no 8GB copy!)
-  u32 *d_cksum_out, *d_sorted_out, *d_arr, *d_pos;
-  CHK(cudaMalloc(&d_cksum_out, sizeof(u32)));
-  CHK(cudaMalloc(&d_sorted_out, sizeof(u32)));
-  CHK(cudaMalloc(&d_arr, N * sizeof(u32)));
-  CHK(cudaMalloc(&d_pos, sizeof(u32)));
-  check_kernel<<<1, 1>>>(g.heap, g.result, d_cksum_out, d_sorted_out, d_arr, d_pos, N);
-  CHK(cudaDeviceSynchronize());
-  u32 cksum, sorted_ok;
-  CHK(cudaMemcpy(&cksum, d_cksum_out, sizeof(u32), cudaMemcpyDeviceToHost));
-  CHK(cudaMemcpy(&sorted_ok, d_sorted_out, sizeof(u32), cudaMemcpyDeviceToHost));
-  printf("%u\n", cksum);
-  fprintf(stderr, "  sort %s\n", sorted_ok ? "PASS" : "FAIL");
-  CHK(cudaFree(d_cksum_out)); CHK(cudaFree(d_sorted_out));
-  CHK(cudaFree(d_arr)); CHK(cudaFree(d_pos));
+  // GPU-side verification (parallel flatten + sequential check)
+  check_kernel<<<(N+255)/256, 256>>>(g.heap, g.result, d_ckarr, d_ckout, (u32)DEPTH, N);
+  check2_kernel<<<1, 1>>>(d_ckarr, d_ckout, N);
+  u32 ck_host[2];
+  CHK(cudaMemcpy(ck_host, d_ckout, 8, cudaMemcpyDeviceToHost));
+  printf("%u\n", ck_host[1]);
+  fprintf(stderr, "  sort %s\n", ck_host[0] ? "PASS" : "FAIL");
 
   free(h_heap);
-  CHK(cudaFree(g.heap)); CHK(cudaFree(g.hptrs));
-  CHK(cudaFree(g.conts)); CHK(cudaFree(g.cbump));
-  CHK(cudaFree(g.tasks)); CHK(cudaFree(g.flat));
-  CHK(cudaFree(g.fcnt)); CHK(cudaFree(g.bcnt));
-  CHK(cudaFree(g.done)); CHK(cudaFree(g.result));
+  CHK(cudaFree(d_mem));
   CHK(cudaEventDestroy(ev0)); CHK(cudaEventDestroy(ev1));
   return 0;
 }
