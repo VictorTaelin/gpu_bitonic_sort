@@ -27,6 +27,7 @@ __host__ __device__ inline u32  GetIdx(u64 t) { return (u32)(t & 0x7FFFFFFFu); }
 // ── Configuration ────────────────────────────────────────────────────────
 #define NB         128        // blocks (1 per SM on RTX 4090)
 #define BS         256        // threads per block
+// #define DEBUG_MATRIX       // uncomment to print task matrix after each phase
 #define NSLOTS     (NB * BS)  // 32768
 #define HEAP_U64   (2u << 30) // 16 GB
 #define CONT_MAX   (1u << 26) // 64M conts
@@ -248,10 +249,15 @@ __global__ void main_kernel(G g) {
   __shared__ Task s_out[BS];
   __shared__ u32  s_outn, s_fbase, s_bcnt;
 
+  int round = 0;
   for (;;) {
     grid.sync();
     u32 fc = *(volatile u32*)g.fcnt;
     if (fc == 0 || *(volatile u32*)g.done) return;
+#ifdef DEBUG_MATRIX
+    if (bid == 0 && tid == 0) printf("R%d fc=%u\n", round, fc);
+#endif
+    round++;
 
     // ── SEED phase (block 0 only) ──
     if (fc <= (u32)NB) {
@@ -288,6 +294,11 @@ __global__ void main_kernel(G g) {
       grid.sync();
       fc = *(volatile u32*)g.fcnt;
       if (fc == 0) return;
+#ifdef DEBUG_MATRIX
+      if (bid == 0 && tid == 0)
+        printf("  SEED fc=%u\n", fc);
+      grid.sync();
+#endif
     }
 
     // ── GROW phase (all blocks) ──
@@ -327,6 +338,18 @@ __global__ void main_kernel(G g) {
       if (tid == 0) g.bcnt[bid] = sn;
       __syncthreads();
     }
+#ifdef DEBUG_MATRIX
+    grid.sync();
+    if (bid == 0 && tid == 0) {
+      u32 total = 0, mn = 99999, mx = 0;
+      for (int b = 0; b < NB; b++) {
+        u32 c = g.bcnt[b]; total += c;
+        if (c < mn) mn = c; if (c > mx) mx = c;
+      }
+      printf("  GROW total=%u  per-block=[%u..%u]\n", total, mn, mx);
+    }
+    grid.sync();
+#endif
     // Reset fcnt before WORK
     if (bid == 0 && tid == 0) { *g.fcnt = 0; }
     grid.sync();
@@ -365,6 +388,14 @@ __global__ void main_kernel(G g) {
         g.flat[s_fbase + i] = s_out[i];
       __syncthreads();
     }
+#ifdef DEBUG_MATRIX
+    grid.sync();
+    if (bid == 0 && tid == 0) {
+      u32 fc2 = *(volatile u32*)g.fcnt;
+      printf("  WORK→fc=%u\n", fc2);
+    }
+    grid.sync();
+#endif
     // Loop back → grid.sync() at top reads new fcnt
   }
 }
@@ -400,6 +431,7 @@ int main(int argc, char **argv) {
   fprintf(stderr, "Bitonic sort depth=%d elems=%u  (%d blocks × %d threads)\n", DEPTH, N, NB, BS);
 
   CHK(cudaDeviceSetLimit(cudaLimitStackSize, 8192));
+
 
   // Single GPU allocation
   #define ALIGN256(x) (((x) + 255) & ~(size_t)255)
