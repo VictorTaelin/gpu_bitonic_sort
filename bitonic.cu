@@ -288,8 +288,12 @@ __global__ void main_kernel(G g) {
         __syncthreads();
 #ifdef DEBUG_MATRIX
         if (tid == 0) {
-          printf("TICK=%04d SEED ", tick++);
-          for (int b = 0; b < NB; b++) { printf("%02x", (b == 0) ? sn : 0); if (b < NB-1) printf("|"); }
+          // shade: " ░▒▓█" mapped to 0, 1-63, 64-127, 128-191, 192-256
+          printf("S%04d:", tick++);
+          for (int b = 0; b < NB; b++) {
+            u32 v = (b == 0) ? sn : 0;
+            printf("%s", v==0 ? " " : v<=(u32)(BS/4) ? "░" : v<=(u32)(BS/2) ? "▒" : v<=(u32)(3*BS/4) ? "▓" : "█");
+          }
           printf("\n");
         }
 #endif
@@ -340,8 +344,11 @@ __global__ void main_kernel(G g) {
 #ifdef DEBUG_MATRIX
     grid.sync();
     if (bid == 0 && tid == 0) {
-      printf("TICK=%04d GROW ", tick++);
-      for (int b = 0; b < NB; b++) { printf("%02x", g.bcnt[b]); if (b < NB-1) printf("|"); }
+      printf("G%04d:", tick++);
+      for (int b = 0; b < NB; b++) {
+        u32 v = g.bcnt[b];
+        printf("%s", v==0 ? " " : v<=(u32)(BS/4) ? "░" : v<=(u32)(BS/2) ? "▒" : v<=(u32)(3*BS/4) ? "▓" : "█");
+      }
       printf("\n");
     }
     grid.sync();
@@ -390,8 +397,11 @@ __global__ void main_kernel(G g) {
     if (bid == 0 && tid == 0) {
       u32 fc2 = *(volatile u32*)g.fcnt;
       u32 perb = fc2 / NB, extra = fc2 % NB;
-      printf("TICK=%04d WORK ", tick++);
-      for (int b = 0; b < NB; b++) { printf("%02x", perb + ((u32)b < extra ? 1 : 0)); if (b < NB-1) printf("|"); }
+      printf("W%04d:", tick++);
+      for (int b = 0; b < NB; b++) {
+        u32 v = perb + ((u32)b < extra ? 1 : 0);
+        printf("%s", v==0 ? " " : v<=(u32)(BS/4) ? "░" : v<=(u32)(BS/2) ? "▒" : v<=(u32)(3*BS/4) ? "▓" : "█");
+      }
       printf("\n");
     }
     grid.sync();
