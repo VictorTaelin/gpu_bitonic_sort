@@ -103,14 +103,14 @@
 // ------
 //
 // Trees live on a flat u64 heap. A Node at index i stores left at heap[i],
-// right at heap[i+1]. The heap is split into equal per-thread slices --
-// each thread bumps a local pointer, zero contention.
+// right at heap[i+1]. The heap uses a chunked bump allocator: each thread
+// gets an initial 32 KB chunk, and can dynamically acquire more via a
+// global atomic counter. No per-thread limit.
 //
 // Continuations use a separate buffer with a chunked bump allocator.
 //
-// The WORK phase uses an explicit stack in shared memory (21 KB) for the
-// iterative evaluator. Max stack depth is 5 frames x 16 bytes = 80 bytes
-// per thread. Stride = 21 u32 words for bank-conflict-free access.
+// The WORK phase uses an explicit stack in shared memory for the
+// iterative evaluator. Overflow spills to a per-thread global stack.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -131,6 +131,7 @@ typedef unsigned short     u16;
 #define BLOCK_SIZE 256
 #define NUM_SLOTS  (NUM_BLOCKS * BLOCK_SIZE)
 #define HEAP_SIZE  (1u << 31)
+#define HEAP_CHUNK 4096
 #define CONT_CAP   (1u << 25)
 #define CONT_CHUNK 2
 #define GSTK_SIZE  (1ull << 32)
@@ -233,6 +234,8 @@ struct Result {
 struct State {
   u64  *heap;
   u32  *heap_ptrs;
+  u32  *heap_ends;
+  u32  *heap_bump;
   Cont *conts;
   u32  *cont_bump;
   Task *tasks;
@@ -259,7 +262,11 @@ __host__ __device__ inline u32 hi(u64 p) {
   return (u32)(p >> 32);
 }
 
-__device__ inline u32 alloc_node(u64 l, u64 r, u64 *H, u32 &hp) {
+__device__ inline u32 alloc_node(u64 l, u64 r, u64 *H, u32 &hp, u32 &he, u32 *hb) {
+  if (hp + 2 > he) {
+    hp = atomicAdd(hb, (u32)HEAP_CHUNK);
+    he = hp + HEAP_CHUNK;
+  }
   u32 i = hp;
   hp += 2;
   H[i] = l;
@@ -361,7 +368,7 @@ inline void cuda_check(cudaError_t err, const char *file, int line) {
 
 // gen(d, x)
 
-__device__ Result par_gen_0(u32 ret, u64 *args, u64 *H, u32 &hp, Cont *C, u32 ci) {
+__device__ Result par_gen_0(u32 ret, u64 *args, u64 *H, u32 &hp, u32 &he, u32 *hb, Cont *C, u32 ci) {
   u32 d = lo(args[0]);
   u32 x = hi(args[0]);
   if (d == 0) {
@@ -373,13 +380,13 @@ __device__ Result par_gen_0(u32 ret, u64 *args, u64 *H, u32 &hp, Cont *C, u32 ci
   return make_split(t0, t1);
 }
 
-__device__ Result par_gen_1(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &lp, u32 &le) {
-  return make_value(make_node(alloc_node(co->slots[0], co->slots[1], H, hp)));
+__device__ Result par_gen_1(Cont *co, u64 *H, u32 &hp, u32 &he, u32 *hb, Cont *C, u32 *cb, u32 &lp, u32 &le) {
+  return make_value(make_node(alloc_node(co->slots[0], co->slots[1], H, hp, he, hb)));
 }
 
 // sort(d, s, t)
 
-__device__ Result par_sort_0(u32 ret, u64 *args, u64 *H, u32 &hp, Cont *C, u32 ci) {
+__device__ Result par_sort_0(u32 ret, u64 *args, u64 *H, u32 &hp, u32 &he, u32 *hb, Cont *C, u32 ci) {
   u32 d = lo(args[0]);
   u32 s = hi(args[0]);
   u64 t = args[1];
@@ -394,10 +401,10 @@ __device__ Result par_sort_0(u32 ret, u64 *args, u64 *H, u32 &hp, Cont *C, u32 c
   return make_split(t0, t1);
 }
 
-__device__ Result par_sort_1(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &lp, u32 &le) {
+__device__ Result par_sort_1(Cont *co, u64 *H, u32 &hp, u32 &he, u32 *hb, Cont *C, u32 *cb, u32 &lp, u32 &le) {
   u32 d = co->a0;
   u32 s = co->a1;
-  u64 t = make_node(alloc_node(co->slots[0], co->slots[1], H, hp));
+  u64 t = make_node(alloc_node(co->slots[0], co->slots[1], H, hp, he, hb));
   if (d == 0 || is_leaf(t)) {
     return make_value(t);
   }
@@ -409,7 +416,7 @@ __device__ Result par_sort_1(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &l
 
 // flow(d, s, t) / down(d, s, t)
 
-__device__ Result par_flow_0(u32 ret, u64 *args, u64 *H, u32 &hp, Cont *C, u32 ci) {
+__device__ Result par_flow_0(u32 ret, u64 *args, u64 *H, u32 &hp, u32 &he, u32 *hb, Cont *C, u32 ci) {
   u32 d = lo(args[0]);
   u32 s = hi(args[0]);
   u64 t = args[1];
@@ -421,7 +428,7 @@ __device__ Result par_flow_0(u32 ret, u64 *args, u64 *H, u32 &hp, Cont *C, u32 c
   return make_call(swap);
 }
 
-__device__ Result par_flow_after(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &lp, u32 &le) {
+__device__ Result par_flow_after(Cont *co, u64 *H, u32 &hp, u32 &he, u32 *hb, Cont *C, u32 *cb, u32 &lp, u32 &le) {
   u32 d = co->a0;
   u32 s = co->a1;
   u64 t = co->slots[0];
@@ -437,13 +444,13 @@ __device__ Result par_flow_after(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u3
   return make_split(t0, t1);
 }
 
-__device__ Result par_flow_join(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &lp, u32 &le) {
-  return make_value(make_node(alloc_node(co->slots[0], co->slots[1], H, hp)));
+__device__ Result par_flow_join(Cont *co, u64 *H, u32 &hp, u32 &he, u32 *hb, Cont *C, u32 *cb, u32 &lp, u32 &le) {
+  return make_value(make_node(alloc_node(co->slots[0], co->slots[1], H, hp, he, hb)));
 }
 
 // warp(d, s, a, b) -- called "swap" in task IDs
 
-__device__ Result par_swap_0(u32 ret, u64 *args, u64 *H, u32 &hp, Cont *C, u32 ci) {
+__device__ Result par_swap_0(u32 ret, u64 *args, u64 *H, u32 &hp, u32 &he, u32 *hb, Cont *C, u32 ci) {
   u32 s = lo(args[0]);
   u32 d = hi(args[0]);
   u64 t = args[1];
@@ -457,25 +464,25 @@ __device__ Result par_swap_0(u32 ret, u64 *args, u64 *H, u32 &hp, Cont *C, u32 c
     u32 vb = get_val(r);
     u32 sw = s ^ (va > vb ? 1u : 0u);
     if (sw == 0) {
-      return make_value(make_node(alloc_node(make_leaf(va), make_leaf(vb), H, hp)));
+      return make_value(make_node(alloc_node(make_leaf(va), make_leaf(vb), H, hp, he, hb)));
     } else {
-      return make_value(make_node(alloc_node(make_leaf(vb), make_leaf(va), H, hp)));
+      return make_value(make_node(alloc_node(make_leaf(vb), make_leaf(va), H, hp, he, hb)));
     }
   }
-  u32 p0 = alloc_node(H[get_idx(l)], H[get_idx(r)], H, hp);
-  u32 p1 = alloc_node(H[get_idx(l) + 1], H[get_idx(r) + 1], H, hp);
+  u32 p0 = alloc_node(H[get_idx(l)], H[get_idx(r)], H, hp, he, hb);
+  u32 p1 = alloc_node(H[get_idx(l) + 1], H[get_idx(r) + 1], H, hp, he, hb);
   init_cont(&C[ci], 2, ret, FN_SWAP_J, 0, 0);
   Task t0 = make_task(FN_SWAP, enc_ret(ci, 0), pack(s, d - 1), make_node(p0));
   Task t1 = make_task(FN_SWAP, enc_ret(ci, 1), pack(s, d - 1), make_node(p1));
   return make_split(t0, t1);
 }
 
-__device__ Result par_swap_1(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &lp, u32 &le) {
+__device__ Result par_swap_1(Cont *co, u64 *H, u32 &hp, u32 &he, u32 *hb, Cont *C, u32 *cb, u32 &lp, u32 &le) {
   u64 r0 = co->slots[0];
   u64 r1 = co->slots[1];
-  u32 li = alloc_node(H[get_idx(r0)], H[get_idx(r1)], H, hp);
-  u32 ri = alloc_node(H[get_idx(r0) + 1], H[get_idx(r1) + 1], H, hp);
-  return make_value(make_node(alloc_node(make_node(li), make_node(ri), H, hp)));
+  u32 li = alloc_node(H[get_idx(r0)], H[get_idx(r1)], H, hp, he, hb);
+  u32 ri = alloc_node(H[get_idx(r0) + 1], H[get_idx(r1) + 1], H, hp, he, hb);
+  return make_value(make_node(alloc_node(make_node(li), make_node(ri), H, hp, he, hb)));
 }
 
 // checksum(t, d)
@@ -488,7 +495,7 @@ __device__ u32 pow31(u32 n) {
   return r;
 }
 
-__device__ Result par_csum_0(u32 ret, u64 *args, u64 *H, u32 &hp, Cont *C, u32 ci) {
+__device__ Result par_csum_0(u32 ret, u64 *args, u64 *H, u32 &hp, u32 &he, u32 *hb, Cont *C, u32 ci) {
   u32 d = lo(args[0]);
   u64 t = args[1];
   if (d == 0) {
@@ -500,7 +507,7 @@ __device__ Result par_csum_0(u32 ret, u64 *args, u64 *H, u32 &hp, Cont *C, u32 c
   return make_split(t0, t1);
 }
 
-__device__ Result par_csum_1(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &lp, u32 &le) {
+__device__ Result par_csum_1(Cont *co, u64 *H, u32 &hp, u32 &he, u32 *hb, Cont *C, u32 *cb, u32 &lp, u32 &le) {
   u32 d = co->a0;
   u32 l = (u32)co->slots[0];
   u32 r = (u32)co->slots[1];
@@ -512,25 +519,25 @@ __device__ Result par_csum_1(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &l
 // The ONLY bridge between compiled functions and the generic runtime.
 // The runtime calls these three functions and nothing else.
 
-__device__ Result dispatch_split(Task &task, u64 *H, u32 &hp, Cont *C, u32 ci) {
+__device__ Result dispatch_split(Task &task, u64 *H, u32 &hp, u32 &he, u32 *hb, Cont *C, u32 ci) {
   switch (task.fn) {
-    case FN_GEN:  return par_gen_0(task.ret, task.args, H, hp, C, ci);
-    case FN_SORT: return par_sort_0(task.ret, task.args, H, hp, C, ci);
-    case FN_FLOW: return par_flow_0(task.ret, task.args, H, hp, C, ci);
-    case FN_SWAP: return par_swap_0(task.ret, task.args, H, hp, C, ci);
-    case FN_CSUM: return par_csum_0(task.ret, task.args, H, hp, C, ci);
+    case FN_GEN:  return par_gen_0(task.ret, task.args, H, hp, he, hb, C, ci);
+    case FN_SORT: return par_sort_0(task.ret, task.args, H, hp, he, hb, C, ci);
+    case FN_FLOW: return par_flow_0(task.ret, task.args, H, hp, he, hb, C, ci);
+    case FN_SWAP: return par_swap_0(task.ret, task.args, H, hp, he, hb, C, ci);
+    case FN_CSUM: return par_csum_0(task.ret, task.args, H, hp, he, hb, C, ci);
     default:      return make_value(0);
   }
 }
 
-__device__ Result dispatch_cont(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &lp, u32 &le) {
+__device__ Result dispatch_cont(Cont *co, u64 *H, u32 &hp, u32 &he, u32 *hb, Cont *C, u32 *cb, u32 &lp, u32 &le) {
   switch (co->fn) {
-    case FN_GEN_J:  return par_gen_1(co, H, hp, C, cb, lp, le);
-    case FN_SORT_C: return par_sort_1(co, H, hp, C, cb, lp, le);
-    case FN_FLOW_A: return par_flow_after(co, H, hp, C, cb, lp, le);
-    case FN_FLOW_J: return par_flow_join(co, H, hp, C, cb, lp, le);
-    case FN_SWAP_J: return par_swap_1(co, H, hp, C, cb, lp, le);
-    case FN_CSUM_J: return par_csum_1(co, H, hp, C, cb, lp, le);
+    case FN_GEN_J:  return par_gen_1(co, H, hp, he, hb, C, cb, lp, le);
+    case FN_SORT_C: return par_sort_1(co, H, hp, he, hb, C, cb, lp, le);
+    case FN_FLOW_A: return par_flow_after(co, H, hp, he, hb, C, cb, lp, le);
+    case FN_FLOW_J: return par_flow_join(co, H, hp, he, hb, C, cb, lp, le);
+    case FN_SWAP_J: return par_swap_1(co, H, hp, he, hb, C, cb, lp, le);
+    case FN_CSUM_J: return par_csum_1(co, H, hp, he, hb, C, cb, lp, le);
     default:        return make_value(0);
   }
 }
@@ -540,7 +547,7 @@ __device__ Result dispatch_cont(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32
 //
 // Replaces recursive seq_* functions with a single iterative function
 // using an explicit stack in shared memory. Each stack frame is 4 x u32
-// = 16 bytes. Max depth is 5 frames = 80 bytes per thread.
+// = 16 bytes. Max depth is 6 frames = 96 bytes per thread.
 //
 // Frame layout (all types use 4 words):
 //   word0: tag_word = (type << 28) | (d << 5) | s
@@ -586,7 +593,7 @@ __device__ inline void swr(u32 *sk, u32 *gsk, u32 i, u32 v) {
   }
 }
 
-__device__ u64 dispatch_seq(Task &task, u64 *H, u32 &hp, u32 *sk, u32 *gsk) {
+__device__ u64 dispatch_seq(Task &task, u64 *H, u32 &hp, u32 &he, u32 *hb, u32 *sk, u32 *gsk) {
   u32 sp = 0;
   u64 res;
   u32 fn, d, s, x;
@@ -709,9 +716,9 @@ ENTER_WARP:
     u32 vb = get_val(b);
     u32 sw = s ^ (va > vb ? 1u : 0u);
     if (sw == 0) {
-      res = make_node(alloc_node(make_leaf(va), make_leaf(vb), H, hp));
+      res = make_node(alloc_node(make_leaf(va), make_leaf(vb), H, hp, he, hb));
     } else {
-      res = make_node(alloc_node(make_leaf(vb), make_leaf(va), H, hp));
+      res = make_node(alloc_node(make_leaf(vb), make_leaf(va), H, hp, he, hb));
     }
     goto POP;
   }
@@ -765,27 +772,27 @@ POP:
       switch (ty) {
         case CF_GEN: {
           u64 left = unpack_tree(srd(sk, gsk, sp + 3));
-          res = make_node(alloc_node(left, res, H, hp));
+          res = make_node(alloc_node(left, res, H, hp, he, hb));
           goto POP;
         }
         case CF_SORT: {
           u64 left = unpack_tree(srd(sk, gsk, sp + 3));
           d = TW_D(w0);
           s = TW_S(w0);
-          t = make_node(alloc_node(left, res, H, hp));
+          t = make_node(alloc_node(left, res, H, hp, he, hb));
           goto ENTER_FLOW;
         }
         case CF_DOWN: {
           u64 left = unpack_tree(srd(sk, gsk, sp + 3));
-          res = make_node(alloc_node(left, res, H, hp));
+          res = make_node(alloc_node(left, res, H, hp, he, hb));
           goto POP;
         }
         case CF_WARP: {
           u64 left = unpack_tree(srd(sk, gsk, sp + 3));
           u64 right = res;
-          u32 li = alloc_node(H[get_idx(left)], H[get_idx(right)], H, hp);
-          u32 ri = alloc_node(H[get_idx(left) + 1], H[get_idx(right) + 1], H, hp);
-          res = make_node(alloc_node(make_node(li), make_node(ri), H, hp));
+          u32 li = alloc_node(H[get_idx(left)], H[get_idx(right)], H, hp, he, hb);
+          u32 ri = alloc_node(H[get_idx(left) + 1], H[get_idx(right) + 1], H, hp, he, hb);
+          res = make_node(alloc_node(make_node(li), make_node(ri), H, hp, he, hb));
           goto POP;
         }
         case CF_CSUM: {
@@ -848,7 +855,7 @@ POP:
 // When a VALUE is produced, deliver it to the parent continuation. If
 // pending hits zero, fire the joiner. Results may cascade upward.
 
-__device__ void resolve(u32 ret, u64 val, u64 *H, u32 &hp, Cont *C, u32 &lp, u32 &le, u32 *cb, Task *out, u32 *out_n, u32 *done, u64 *result) {
+__device__ void resolve(u32 ret, u64 val, u64 *H, u32 &hp, u32 &he, u32 *hb, Cont *C, u32 &lp, u32 &le, u32 *cb, Task *out, u32 *out_n, u32 *done, u64 *result) {
   for (;;) {
     if (ret == ROOT_RET) {
       *result = val;
@@ -870,11 +877,9 @@ __device__ void resolve(u32 ret, u64 val, u64 *H, u32 &hp, Cont *C, u32 &lp, u32
     }
 
     // Reload the other child's slot from L2 (bypass stale L1).
-    // The other child's atomicExch ensured the write reached L2.
-    // Our atomicSub observed their result, so the slot is in L2.
     u32 other = 1 - slot;
     co->slots[other] = __ldcg(&co->slots[other]);
-    Result r = dispatch_cont(co, H, hp, C, cb, lp, le);
+    Result r = dispatch_cont(co, H, hp, he, hb, C, cb, lp, le);
 
     if (r.tag == R_VALUE) {
       val = r.val;
@@ -934,8 +939,9 @@ __global__ void evaluator(State S) {
   __shared__ u32  cnt, cnt_new, cb_base, cb_used;
   __shared__ u32  out_n, out_base;
 
-  // Keep heap pointer in register across all rounds.
+  // Keep heap pointer and chunk end in registers across all rounds.
   u32 hp = S.heap_ptrs[sid];
+  u32 he = S.heap_ends[sid];
 
 #ifdef DEBUG_MATRIX
   int tick = 0;
@@ -978,7 +984,7 @@ __global__ void evaluator(State S) {
 
           if (active) {
             u32 ci = cb_base + atomicAdd(&cb_used, 1u);
-            Result r = dispatch_split(my_task, S.heap, hp, S.conts, ci);
+            Result r = dispatch_split(my_task, S.heap, hp, he, S.heap_bump, S.conts, ci);
             if (r.tag == R_SPLIT) {
               u32 j = atomicAdd(&cnt_new, 2u);
               buf[j] = r.t0;
@@ -1057,7 +1063,7 @@ __global__ void evaluator(State S) {
 
         if (active) {
           u32 ci = cb_base + atomicAdd(&cb_used, 1u);
-          Result r = dispatch_split(my_task, S.heap, hp, S.conts, ci);
+          Result r = dispatch_split(my_task, S.heap, hp, he, S.heap_bump, S.conts, ci);
           if (r.tag == R_SPLIT) {
             u32 j = atomicAdd(&cnt_new, 2u);
             buf[j] = r.t0;
@@ -1119,8 +1125,8 @@ __global__ void evaluator(State S) {
 
       if (active) {
         u32 *gsk = S.gstk + (u64)sid * GSTK_WORDS;
-        u64 val = dispatch_seq(my_task, S.heap, hp, stk[tid], gsk);
-        resolve(my_task.ret, val, S.heap, hp, S.conts, clp, cle, S.cont_bump, buf, &out_n, S.done, S.result);
+        u64 val = dispatch_seq(my_task, S.heap, hp, he, S.heap_bump, stk[tid], gsk);
+        resolve(my_task.ret, val, S.heap, hp, he, S.heap_bump, S.conts, clp, cle, S.cont_bump, buf, &out_n, S.done, S.result);
       }
       __syncthreads();
 
@@ -1150,8 +1156,9 @@ __global__ void evaluator(State S) {
 #endif
   }
 
-  // Write heap pointer back once at kernel exit (instead of every round).
+  // Write heap state back at kernel exit.
   S.heap_ptrs[sid] = hp;
+  S.heap_ends[sid] = he;
 }
 
 // Host
@@ -1217,6 +1224,8 @@ int main(int argc, char **argv) {
   size_t off = 0;
   size_t p_heap = off; off += ALIGN((size_t)HEAP_SIZE * 8);
   size_t p_hptr = off; off += ALIGN((size_t)NUM_SLOTS * 4);
+  size_t p_hend = off; off += ALIGN((size_t)NUM_SLOTS * 4);
+  size_t p_hbmp = off; off += ALIGN(4);
   size_t p_cont = off; off += ALIGN((size_t)CONT_CAP * sizeof(Cont));
   size_t p_cbmp = off; off += ALIGN(4);
   size_t p_task = off; off += ALIGN((size_t)NUM_SLOTS * sizeof(Task));
@@ -1234,6 +1243,8 @@ int main(int argc, char **argv) {
   State S;
   S.heap      = (u64  *)(mem + p_heap);
   S.heap_ptrs = (u32  *)(mem + p_hptr);
+  S.heap_ends = (u32  *)(mem + p_hend);
+  S.heap_bump = (u32  *)(mem + p_hbmp);
   S.conts     = (Cont *)(mem + p_cont);
   S.cont_bump = (u32  *)(mem + p_cbmp);
   S.tasks     = (Task *)(mem + p_task);
@@ -1244,14 +1255,21 @@ int main(int argc, char **argv) {
   S.result    = (u64  *)(mem + p_res);
   S.gstk      = (u32  *)(mem + p_gstk);
 
-  // Per-slot heap slices.
-  u32 slice = HEAP_SIZE / NUM_SLOTS;
+  // Initialize chunked heap allocator: pre-assign one chunk per thread.
   u32 *hps = (u32 *)malloc(NUM_SLOTS * sizeof(u32));
+  u32 *hes = (u32 *)malloc(NUM_SLOTS * sizeof(u32));
   for (int i = 0; i < NUM_SLOTS; i++) {
-    hps[i] = (u32)i * slice;
+    hps[i] = (u32)i * HEAP_CHUNK;
+    hes[i] = (u32)(i + 1) * HEAP_CHUNK;
   }
   CHK(cudaMemcpy(S.heap_ptrs, hps, NUM_SLOTS * sizeof(u32), cudaMemcpyHostToDevice));
+  CHK(cudaMemcpy(S.heap_ends, hes, NUM_SLOTS * sizeof(u32), cudaMemcpyHostToDevice));
   free(hps);
+  free(hes);
+
+  // Global bump starts past all pre-assigned chunks.
+  u32 bump_init = NUM_SLOTS * HEAP_CHUNK;
+  CHK(cudaMemcpy(S.heap_bump, &bump_init, sizeof(u32), cudaMemcpyHostToDevice));
 
   // Run: gen -> sort -> checksum.
   float ms;
