@@ -27,7 +27,7 @@ __host__ __device__ inline u32  GetIdx(u64 t) { return (u32)(t & 0x7FFFFFFFu); }
 // ── Configuration ────────────────────────────────────────────────────────
 #define NB         128        // blocks (1 per SM on RTX 4090)
 #define BS         256        // threads per block
-// #define DEBUG_MATRIX       // uncomment to print task matrix after each phase
+#define DEBUG_MATRIX       // uncomment to print task matrix after each phase
 #define NSLOTS     (NB * BS)  // 32768
 #define HEAP_U64   (2u << 30) // 16 GB
 #define CONT_MAX   (1u << 26) // 64M conts
@@ -285,6 +285,21 @@ __global__ void main_kernel(G g) {
           cur = 1 - cur;
           if (tid == 0) sn = snew;
           __syncthreads();
+#ifdef DEBUG_MATRIX
+          if (tid == 0) {
+            // During SEED: only block 0 active, show as single-row grid
+            for (int b = 0; b < NB; b++) g.bcnt[b] = (b == 0) ? sn : 0;
+          }
+          __syncthreads();
+          if (tid == 0) {
+            printf("  SEED iter %d:\n", iter);
+            for (int r = 0; r < BS; r++) {
+              for (int b = 0; b < NB; b++) printf("%c", r < (int)g.bcnt[b] ? 'X' : '.');
+              printf("\n");
+            }
+          }
+          __syncthreads();
+#endif
         }
         if (tid < sn) g.flat[tid] = sb[cur][tid];
         g.hptrs[tid] = hp;
@@ -294,11 +309,7 @@ __global__ void main_kernel(G g) {
       grid.sync();
       fc = *(volatile u32*)g.fcnt;
       if (fc == 0) return;
-#ifdef DEBUG_MATRIX
-      if (bid == 0 && tid == 0)
-        printf("  SEED fc=%u\n", fc);
-      grid.sync();
-#endif
+
     }
 
     // ── GROW phase (all blocks) ──
@@ -331,6 +342,18 @@ __global__ void main_kernel(G g) {
         cur = 1 - cur;
         if (tid == 0) sn = snew;
         __syncthreads();
+#ifdef DEBUG_MATRIX
+        if (tid == 0) g.bcnt[bid] = sn;
+        grid.sync();
+        if (bid == 0 && tid == 0) {
+          printf("  GROW iter %d:\n", iter);
+          for (int r = 0; r < BS; r++) {
+            for (int b = 0; b < NB; b++) printf("%c", r < (int)g.bcnt[b] ? 'X' : '.');
+            printf("\n");
+          }
+        }
+        grid.sync();
+#endif
       }
 
       if (tid < sn) g.tasks[bid * BS + tid] = sb[cur][tid];
@@ -338,20 +361,7 @@ __global__ void main_kernel(G g) {
       if (tid == 0) g.bcnt[bid] = sn;
       __syncthreads();
     }
-#ifdef DEBUG_MATRIX
-    grid.sync();
-    if (bid == 0 && tid == 0) {
-      u32 total = 0;
-      for (int b = 0; b < NB; b++) total += g.bcnt[b];
-      printf("  GROW total=%u\n", total);
-      for (int r = 0; r < BS; r++) {
-        for (int b = 0; b < NB; b++)
-          printf("%c", r < (int)g.bcnt[b] ? 'X' : '.');
-        printf("\n");
-      }
-    }
-    grid.sync();
-#endif
+
     // Reset fcnt before WORK
     if (bid == 0 && tid == 0) { *g.fcnt = 0; }
     grid.sync();
@@ -394,7 +404,18 @@ __global__ void main_kernel(G g) {
     grid.sync();
     if (bid == 0 && tid == 0) {
       u32 fc2 = *(volatile u32*)g.fcnt;
-      printf("  WORK→fc=%u\n", fc2);
+      // Show flat buffer as if distributed across NB columns
+      // Each column gets fc2/NB tasks (approximate)
+      printf("  WORK out:\n");
+      u32 perb = (fc2 + NB - 1) / NB;  // ceil
+      if (perb > (u32)BS) perb = BS;
+      for (u32 r = 0; r < (u32)BS; r++) {
+        for (int b = 0; b < NB; b++) {
+          u32 my = (fc2 / NB) + ((u32)b < (fc2 % NB) ? 1 : 0);
+          printf("%c", r < my ? 'X' : '.');
+        }
+        printf("\n");
+      }
     }
     grid.sync();
 #endif
