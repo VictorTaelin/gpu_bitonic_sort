@@ -41,7 +41,7 @@ evaluator runs these concurrently.
 
 - **bitonic.js** — Reference implementation in JavaScript. Clear and simple.
 - **bitonic.c** — Reference implementation in C. Single-threaded, ~2500ms for depth 20.
-- **bitonic.cu** — GPU implementation in CUDA. ~38ms for depth 20 on RTX 4090 (**66× faster**).
+- **bitonic.cu** — GPU implementation in CUDA. ~38ms for depth 20 on RTX 4090 (**64x faster**).
 
 ## How the GPU Evaluator Works
 
@@ -63,35 +63,40 @@ The runtime uses a **SEED / GROW / WORK** architecture:
 This runs as a single cooperative kernel with `grid.sync()` between phases.
 No host synchronization, no queues, no work stealing.
 
-The sequential cutoff emerges naturally: 128 blocks × 256 threads = 32768
+The sequential cutoff emerges naturally: 128 blocks x 256 threads = 32768
 slots, so `sort(20)` bottoms out at `sort(5)` — each thread sorts a
 32-element subtree.
 
 ## Building and Running
 
 ```bash
-# JavaScript (depth 20, ~15s)
+# JavaScript (depth 20)
 node bitonic.js
 
-# C (depth 20, ~2500ms)
+# C (depth 20)
 gcc -O2 -o bitonic bitonic.c
 ./bitonic
 
-# CUDA (depth 20, ~38ms on RTX 4090)
+# CUDA (depth 20)
 nvcc -O3 -use_fast_math -o bitonic_gpu bitonic.cu
 ./bitonic_gpu 20
 ```
 
 All three produce checksum `4027056128` for depth 20.
 
-## Performance
+## Benchmarks
 
-On an RTX 4090 (128 SMs, 24GB VRAM), depth 20 (1M elements):
+Depth 20 (1,048,576 elements), sorting only:
+
+| Implementation | Chip                         | Time     | vs C     |
+|----------------|------------------------------|----------|----------|
+| C (gcc -O2)    | AMD Ryzen 9 7900X (1 thread) | 2,475 ms | 1x       |
+| CUDA           | NVIDIA RTX 4090 (128 SMs)    | 38.5 ms  | **64x**  |
+
+Full GPU phase breakdown:
 
 | Phase    | Time    |
 |----------|---------|
 | gen      | 0.4 ms  |
-| sort     | 38 ms   |
+| sort     | 38.5 ms |
 | checksum | 0.8 ms  |
-
-66× faster than single-threaded C.
