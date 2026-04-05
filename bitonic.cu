@@ -734,13 +734,17 @@ ENTER_WARP:
   {
     u32 ai = get_idx(a);
     u32 bi = get_idx(b);
+    u64 a_left = H[ai];
+    u64 a_right = H[ai + 1];  // same cache line as H[ai]
+    u64 b_left = H[bi];
+    u64 b_right = H[bi + 1];  // same cache line as H[bi]
     swr(sk, gsk, sp, TW(CF_WARP, d, s));
-    swr(sk, gsk, sp + 1, ai + 1);
-    swr(sk, gsk, sp + 2, bi + 1);
+    swr(sk, gsk, sp + 1, pack_tree(a_right));
+    swr(sk, gsk, sp + 2, pack_tree(b_right));
     sp += 4;
     d--;
-    a = H[ai];
-    b = H[bi];
+    a = a_left;
+    b = b_left;
     goto ENTER_WARP;
   }
 
@@ -841,8 +845,8 @@ POP:
         case CF_WARP: {
           s = TW_S(w0);
           d--;
-          a = H[srd(sk, gsk, sp - 3)];
-          b = H[srd(sk, gsk, sp - 2)];
+          a = unpack_tree(srd(sk, gsk, sp - 3));
+          b = unpack_tree(srd(sk, gsk, sp - 2));
           goto ENTER_WARP;
         }
         case CF_CSUM: {
