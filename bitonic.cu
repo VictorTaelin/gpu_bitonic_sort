@@ -138,12 +138,29 @@ typedef unsigned short     u16;
 
 #define NODE_TAG (1ULL << 63)
 
-__host__ __device__ inline u64  make_leaf(u32 val) { return (u64)val; }
-__host__ __device__ inline u64  make_node(u32 idx) { return NODE_TAG | (u64)idx; }
-__host__ __device__ inline bool is_node(u64 t)     { return (t & NODE_TAG) != 0; }
-__host__ __device__ inline bool is_leaf(u64 t)     { return !is_node(t); }
-__host__ __device__ inline u32  get_val(u64 t)     { return (u32)(t & 0xFFFFFFFFu); }
-__host__ __device__ inline u32  get_idx(u64 t)     { return (u32)(t & 0x7FFFFFFFu); }
+__host__ __device__ inline u64 make_leaf(u32 val) {
+  return (u64)val;
+}
+
+__host__ __device__ inline u64 make_node(u32 idx) {
+  return NODE_TAG | (u64)idx;
+}
+
+__host__ __device__ inline bool is_node(u64 t) {
+  return (t & NODE_TAG) != 0;
+}
+
+__host__ __device__ inline bool is_leaf(u64 t) {
+  return !is_node(t);
+}
+
+__host__ __device__ inline u32 get_val(u64 t) {
+  return (u32)(t & 0xFFFFFFFFu);
+}
+
+__host__ __device__ inline u32 get_idx(u64 t) {
+  return (u32)(t & 0x7FFFFFFFu);
+}
 
 // Runtime Structures
 // ------------------
@@ -196,9 +213,17 @@ struct State {
 // Device Helpers
 // --------------
 
-__host__ __device__ inline u64 pack(u32 lo, u32 hi) { return (u64)lo | ((u64)hi << 32); }
-__host__ __device__ inline u32 lo(u64 p)             { return (u32)p; }
-__host__ __device__ inline u32 hi(u64 p)             { return (u32)(p >> 32); }
+__host__ __device__ inline u64 pack(u32 lo, u32 hi) {
+  return (u64)lo | ((u64)hi << 32);
+}
+
+__host__ __device__ inline u32 lo(u64 p) {
+  return (u32)p;
+}
+
+__host__ __device__ inline u32 hi(u64 p) {
+  return (u32)(p >> 32);
+}
 
 __device__ inline u32 alloc_node(u64 l, u64 r, u64 *H, u32 &hp) {
   u32 i = hp;
@@ -208,7 +233,9 @@ __device__ inline u32 alloc_node(u64 l, u64 r, u64 *H, u32 &hp) {
   return i;
 }
 
-__device__ inline u32 enc_ret(u32 ci, u32 slot) { return (ci << 1) | slot; }
+__device__ inline u32 enc_ret(u32 ci, u32 slot) {
+  return (ci << 1) | slot;
+}
 
 __host__ __device__ inline Task make_task(u32 fn, u32 ret, u64 a0, u64 a1 = 0, u64 a2 = 0) {
   Task t;
@@ -283,7 +310,6 @@ inline void cuda_check(cudaError_t err, const char *file, int line) {
 //   par_<name>_1   Joiner: continuation handler (WORK resolution).
 
 // Function IDs
-// ............
 
 #define FN_GEN    0
 #define FN_GEN_J  1
@@ -298,7 +324,6 @@ inline void cuda_check(cudaError_t err, const char *file, int line) {
 #define FN_CSUM_J 10
 
 // gen(d, x)
-// .........
 //
 // Generates a binary tree with leaves labeled by position.
 
@@ -328,7 +353,6 @@ __device__ Result par_gen_1(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &lp
 }
 
 // sort(d, s, t)
-// .............
 //
 // Recursively sorts both halves, then merges via flow.
 
@@ -374,7 +398,6 @@ __device__ Result par_sort_1(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &l
 }
 
 // flow(d, s, t)
-// .............
 //
 // flow itself has no PARALLEL — it calls warp then down. But down has a
 // PARALLEL, so flow compiles to:
@@ -436,7 +459,6 @@ __device__ Result par_flow_join(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32
 }
 
 // warp(d, s, a, b)
-// ................
 //
 // Compare-and-swap across two subtrees. Called "swap" in task IDs.
 
@@ -495,7 +517,6 @@ __device__ Result par_swap_1(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &l
 }
 
 // checksum(t, d)
-// ..............
 //
 // Tree checksum. The original is a sequential fold (result = result*31 + val),
 // but for a balanced tree of known depth we can split: if the left subtree
@@ -538,7 +559,6 @@ __device__ Result par_csum_1(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32 &l
 }
 
 // Dispatch Tables
-// ...............
 //
 // The ONLY bridge between compiled functions and the generic runtime.
 // The runtime calls these three functions and nothing else.
@@ -646,10 +666,18 @@ __device__ void resolve(u32 ret, u64 val, u64 *H, u32 &hp, Cont *C, u32 &lp, u32
 
 #ifdef DEBUG_MATRIX
 __device__ const char *shade(u32 n) {
-  if (n == 0)                         { return " "; }
-  if (n <= (u32)(BLOCK_SIZE / 4))     { return "░"; }
-  if (n <= (u32)(BLOCK_SIZE / 2))     { return "▒"; }
-  if (n <= (u32)(BLOCK_SIZE * 3 / 4)) { return "▓"; }
+  if (n == 0) {
+    return " ";
+  }
+  if (n <= (u32)(BLOCK_SIZE / 4)) {
+    return "░";
+  }
+  if (n <= (u32)(BLOCK_SIZE / 2)) {
+    return "▒";
+  }
+  if (n <= (u32)(BLOCK_SIZE * 3 / 4)) {
+    return "▓";
+  }
   return "█";
 }
 #endif
