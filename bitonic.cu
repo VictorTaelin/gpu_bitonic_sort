@@ -1234,7 +1234,7 @@ int main(int argc, char **argv) {
           depth, 1u << depth, NUM_BLOCKS, BLOCK_SIZE);
 
   size_t heap_entries = 1ull << 31;  // 16 GB
-  size_t cont_cap    = 1ull << 25;   // 1 GB
+  size_t cont_cap    = 1ull << 26;   // 2 GB
 
   // Allocate all GPU memory in one call.
   #define ALIGN(x) (((x) + 255) & ~(size_t)255)
