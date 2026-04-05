@@ -134,9 +134,10 @@ typedef unsigned short     u16;
 #define HEAP_CHUNK 4096
 #define CONT_CHUNK 2
 
-// Global stack: 128 MB safety net (1024 words = 256 frames per thread).
-// Shared memory handles D<=21; this catches deeper recursion.
-#define GSTK_SIZE  (1ull << 27)
+// Global stack: 4 GB (8192 frames per thread).
+// Shared memory handles the common case; this is the safety net
+// for general programs whose sequential tasks overflow shared memory.
+#define GSTK_SIZE  (1ull << 32)
 #define GSTK_WORDS (GSTK_SIZE / NUM_SLOTS / sizeof(u32))
 
 // Shared memory stack: first STK_WORDS of each thread's stack live here.
