@@ -130,15 +130,11 @@ typedef unsigned short     u16;
 #define NUM_BLOCKS 128
 #define BLOCK_SIZE 256
 #define NUM_SLOTS  (NUM_BLOCKS * BLOCK_SIZE)
-#define HEAP_SIZE  (1u << 31)
-#define CONT_CAP   (1u << 25)
+#define HEAP_SIZE  (2u << 30)
+#define CONT_CAP   (1u << 26)
 #define CONT_CHUNK 2
-#define GSTK_SIZE  (1ull << 32)
-#define GSTK_WORDS (GSTK_SIZE / NUM_SLOTS / sizeof(u32))
-
-// Shared memory stack: first STK_WORDS of each thread's stack live here.
-// Overflow spills to the per-thread global memory stack (GSTK_WORDS deep).
-// Stride must be odd for bank-conflict-free shared memory access.
+// Explicit stack for iterative evaluator: 6 frames max (supports depth <= 21).
+// Each frame = 4 x u32 = 16 bytes. Stride = 25 (odd, bank-conflict-free).
 #define STK_WORDS  24
 #define STK_STRIDE 25
 
@@ -241,7 +237,6 @@ struct State {
   u32  *block_cnt;
   u32  *done;
   u64  *result;
-  u32  *gstk;
 };
 
 // Device Helpers
@@ -570,23 +565,7 @@ __device__ Result dispatch_cont(Cont *co, u64 *H, u32 &hp, Cont *C, u32 *cb, u32
 #define TW_D(w)        (((w) >> 5) & 0x1Fu)
 #define TW_S(w)        ((w) & 1u)
 
-// Hybrid stack: shared memory for the first STK_WORDS, global memory beyond.
-__device__ inline u32 srd(u32 *sk, u32 *gsk, u32 i) {
-  if (i < STK_WORDS) {
-    return sk[i];
-  }
-  return gsk[i - STK_WORDS];
-}
-
-__device__ inline void swr(u32 *sk, u32 *gsk, u32 i, u32 v) {
-  if (i < STK_WORDS) {
-    sk[i] = v;
-  } else {
-    gsk[i - STK_WORDS] = v;
-  }
-}
-
-__device__ u64 dispatch_seq(Task &task, u64 *H, u32 &hp, u32 *sk, u32 *gsk) {
+__device__ u64 dispatch_seq(Task &task, u64 *H, u32 &hp, u32 *sk) {
   u32 sp = 0;
   u64 res;
   u32 fn, d, s, x;
@@ -650,8 +629,8 @@ ENTER_GEN:
     res = make_leaf(x);
     goto POP;
   }
-  swr(sk, gsk, sp, TW(CF_GEN, d, 0));
-  swr(sk, gsk, sp + 1, x);
+  sk[sp] = TW(CF_GEN, d, 0);
+  sk[sp + 1] = x;
   sp += 4;
   d--;
   x = x * 2 + 1;
@@ -664,8 +643,8 @@ ENTER_SORT:
   }
   {
     u32 idx = get_idx(t);
-    swr(sk, gsk, sp, TW(CF_SORT, d, s));
-    swr(sk, gsk, sp + 1, pack_tree(H[idx + 1]));
+    sk[sp] = TW(CF_SORT, d, s);
+    sk[sp + 1] = pack_tree(H[idx + 1]);
     sp += 4;
     d--;
     s = 0;
@@ -680,7 +659,7 @@ ENTER_FLOW:
   }
   {
     u32 idx = get_idx(t);
-    swr(sk, gsk, sp, TW(CF_FLOW, d, s));
+    sk[sp] = TW(CF_FLOW, d, s);
     sp += 4;
     a = H[idx];
     b = H[idx + 1];
@@ -695,8 +674,8 @@ ENTER_DOWN:
   }
   {
     u32 idx = get_idx(t);
-    swr(sk, gsk, sp, TW(CF_DOWN, d, s));
-    swr(sk, gsk, sp + 1, pack_tree(H[idx + 1]));
+    sk[sp] = TW(CF_DOWN, d, s);
+    sk[sp + 1] = pack_tree(H[idx + 1]);
     sp += 4;
     d--;
     t = H[idx];
@@ -718,9 +697,9 @@ ENTER_WARP:
   {
     u32 ai = get_idx(a);
     u32 bi = get_idx(b);
-    swr(sk, gsk, sp, TW(CF_WARP, d, s));
-    swr(sk, gsk, sp + 1, ai + 1);
-    swr(sk, gsk, sp + 2, bi + 1);
+    sk[sp] = TW(CF_WARP, d, s);
+    sk[sp + 1] = ai + 1;
+    sk[sp + 2] = bi + 1;
     sp += 4;
     d--;
     a = H[ai];
@@ -735,8 +714,8 @@ ENTER_CSUM:
   }
   {
     u32 idx = get_idx(t);
-    swr(sk, gsk, sp, TW(CF_CSUM, d, 0));
-    swr(sk, gsk, sp + 1, pack_tree(H[idx + 1]));
+    sk[sp] = TW(CF_CSUM, d, 0);
+    sk[sp + 1] = pack_tree(H[idx + 1]);
     sp += 4;
     d--;
     t = H[idx];
@@ -749,7 +728,7 @@ POP:
   }
   sp -= 4;
   {
-    u32 w0 = srd(sk, gsk, sp);
+    u32 w0 = sk[sp];
     u32 ty = TW_TYPE(w0);
 
     // FLOW: warp done -> tail-call down (no phases)
@@ -764,24 +743,24 @@ POP:
       // Phase 1: right call done -> combine and return
       switch (ty) {
         case CF_GEN: {
-          u64 left = unpack_tree(srd(sk, gsk, sp + 3));
+          u64 left = unpack_tree(sk[sp + 3]);
           res = make_node(alloc_node(left, res, H, hp));
           goto POP;
         }
         case CF_SORT: {
-          u64 left = unpack_tree(srd(sk, gsk, sp + 3));
+          u64 left = unpack_tree(sk[sp + 3]);
           d = TW_D(w0);
           s = TW_S(w0);
           t = make_node(alloc_node(left, res, H, hp));
           goto ENTER_FLOW;
         }
         case CF_DOWN: {
-          u64 left = unpack_tree(srd(sk, gsk, sp + 3));
+          u64 left = unpack_tree(sk[sp + 3]);
           res = make_node(alloc_node(left, res, H, hp));
           goto POP;
         }
         case CF_WARP: {
-          u64 left = unpack_tree(srd(sk, gsk, sp + 3));
+          u64 left = unpack_tree(sk[sp + 3]);
           u64 right = res;
           u32 li = alloc_node(H[get_idx(left)], H[get_idx(right)], H, hp);
           u32 ri = alloc_node(H[get_idx(left) + 1], H[get_idx(right) + 1], H, hp);
@@ -789,7 +768,7 @@ POP:
           goto POP;
         }
         case CF_CSUM: {
-          u32 lv = srd(sk, gsk, sp + 3);
+          u32 lv = sk[sp + 3];
           u32 rv = (u32)res;
           d = TW_D(w0);
           res = (u64)(lv * pow31(1u << (d - 1)) + rv);
@@ -798,39 +777,39 @@ POP:
       }
     } else {
       // Phase 0: left call done -> save left result, start right call
-      swr(sk, gsk, sp + 3, (ty == CF_CSUM) ? (u32)res : pack_tree(res));
-      swr(sk, gsk, sp, w0 | PHASE_BIT);
+      sk[sp + 3] = (ty == CF_CSUM) ? (u32)res : pack_tree(res);
+      sk[sp] = w0 | PHASE_BIT;
       sp += 4;
       d = TW_D(w0);
 
       switch (ty) {
         case CF_GEN: {
-          x = srd(sk, gsk, sp - 3);
+          x = sk[sp - 3];
           d--;
           x = x * 2;
           goto ENTER_GEN;
         }
         case CF_SORT: {
-          t = unpack_tree(srd(sk, gsk, sp - 3));
+          t = unpack_tree(sk[sp - 3]);
           d--;
           s = 1;
           goto ENTER_SORT;
         }
         case CF_DOWN: {
           s = TW_S(w0);
-          t = unpack_tree(srd(sk, gsk, sp - 3));
+          t = unpack_tree(sk[sp - 3]);
           d--;
           goto ENTER_FLOW;
         }
         case CF_WARP: {
           s = TW_S(w0);
           d--;
-          a = H[srd(sk, gsk, sp - 3)];
-          b = H[srd(sk, gsk, sp - 2)];
+          a = H[sk[sp - 3]];
+          b = H[sk[sp - 2]];
           goto ENTER_WARP;
         }
         case CF_CSUM: {
-          t = unpack_tree(srd(sk, gsk, sp - 3));
+          t = unpack_tree(sk[sp - 3]);
           d--;
           goto ENTER_CSUM;
         }
@@ -1118,8 +1097,7 @@ __global__ void evaluator(State S) {
       u32 clp = 0, cle = 0;
 
       if (active) {
-        u32 *gsk = S.gstk + (u64)sid * GSTK_WORDS;
-        u64 val = dispatch_seq(my_task, S.heap, hp, stk[tid], gsk);
+        u64 val = dispatch_seq(my_task, S.heap, hp, stk[tid]);
         resolve(my_task.ret, val, S.heap, hp, S.conts, clp, cle, S.cont_bump, buf, &out_n, S.done, S.result);
       }
       __syncthreads();
@@ -1225,7 +1203,6 @@ int main(int argc, char **argv) {
   size_t p_bcnt = off; off += ALIGN((size_t)NUM_BLOCKS * 4);
   size_t p_done = off; off += ALIGN(4);
   size_t p_res  = off; off += ALIGN(8);
-  size_t p_gstk = off; off += ALIGN((size_t)GSTK_SIZE);
 
   char *mem;
   CHK(cudaMalloc(&mem, off));
@@ -1242,7 +1219,6 @@ int main(int argc, char **argv) {
   S.block_cnt = (u32  *)(mem + p_bcnt);
   S.done      = (u32  *)(mem + p_done);
   S.result    = (u64  *)(mem + p_res);
-  S.gstk      = (u32  *)(mem + p_gstk);
 
   // Per-slot heap slices.
   u32 slice = HEAP_SIZE / NUM_SLOTS;
