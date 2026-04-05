@@ -91,7 +91,7 @@ Sorting only, measured on AMD Ryzen 9 7900X + NVIDIA RTX 4090:
 | Depth | Elements  | C (1 thread) | CUDA (128 SMs) | Speedup  |
 |-------|-----------|--------------|----------------|----------|
 | 20    | 1,048,576 | 2,475 ms     | 36.7 ms        | **67x**  |
-| 21    | 2,097,152 | 5,546 ms     | 88.3 ms        | **63x**  |
+| 21    | 2,097,152 | 5,589 ms     | 88.4 ms        | **63x**  |
 
 Full GPU phase breakdown (depth 20):
 
@@ -100,3 +100,24 @@ Full GPU phase breakdown (depth 20):
 | gen      | 0.2 ms  |
 | sort     | 36.7 ms |
 | checksum | 0.8 ms  |
+
+## Performance Analysis
+
+The kernel is **84% memory-latency bound** (long scoreboard stalls). With
+128 blocks × 256 threads = 1 block per SM = 8 warps, there aren't enough
+concurrent memory requests to hide L2/DRAM latency.
+
+| Metric | Value |
+|--------|-------|
+| Registers/thread | 104 |
+| Warps active | 16.67% (8/48) |
+| L1 hit rate | 48% |
+| L2 hit rate | 92% |
+| Long scoreboard stall | 84% |
+| Local mem ops (stack spills) | 249M |
+| Global mem ops (heap) | 14M |
+
+Stack spills from recursive `seq_*` functions generate **18× more memory
+traffic** than actual heap accesses. These spills are structural to the
+recursion pattern and cannot be eliminated without changing the compiled
+functions (i.e., converting recursion to iteration).
