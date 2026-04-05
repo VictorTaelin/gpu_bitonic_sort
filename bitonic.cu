@@ -630,15 +630,19 @@ __device__ void resolve(u32 ret, u64 val, u64 *H, u32 &hp, Cont *C, u32 &lp, u32
     u32 slot = ret & 1;
     Cont *co = &C[ci];
 
-    co->slots[slot] = val;
-    __threadfence();
+    // Write slot via L2 atomic — ensures visibility without __threadfence().
+    atomicExch((unsigned long long *)&co->slots[slot], val);
 
     u32 old = atomicSub(&co->pend, 1u);
     if (old != 1u) {
       return;
     }
 
-    __threadfence();
+    // Reload the other child's slot from L2 (bypass stale L1).
+    // The other child's atomicExch ensured the write reached L2.
+    // Our atomicSub observed their result, so the slot is in L2.
+    u32 other = 1 - slot;
+    co->slots[other] = __ldcg(&co->slots[other]);
     Result r = dispatch_cont(co, H, hp, C, cb, lp, le);
 
     if (r.tag == R_VALUE) {
@@ -694,11 +698,9 @@ __global__ void evaluator(State S) {
   int bid = blockIdx.x;
   int sid = bid * BLOCK_SIZE + tid;
 
-  __shared__ Task buf[2][BLOCK_SIZE];
+  __shared__ Task buf[BLOCK_SIZE];
   __shared__ u32  cnt, cnt_new, cb_base, cb_used;
-  __shared__ Task out[BLOCK_SIZE];
   __shared__ u32  out_n, out_base;
-  __shared__ u32  grow_cur;
 
   // Keep heap pointer in register across all rounds.
   u32 hp = S.heap_ptrs[sid];
@@ -722,7 +724,7 @@ __global__ void evaluator(State S) {
     if (fc < (u32)NUM_BLOCKS) {
       if (bid == 0) {
         if (tid < fc) {
-          buf[0][tid] = S.flat[tid];
+          buf[tid] = S.flat[tid];
         }
         if (tid == 0) {
           cnt = fc;
@@ -731,28 +733,30 @@ __global__ void evaluator(State S) {
         }
         __syncthreads();
 
-        int cur = 0;
-
         for (int i = 0; i < 32 && cnt > 0 && cnt <= (u32)(NUM_BLOCKS / 2); i++) {
+          Task my_task;
+          bool active = (tid < cnt);
+          if (active) {
+            my_task = buf[tid];
+          }
           if (tid == 0) {
             cnt_new = 0;
           }
           __syncthreads();
 
-          if (tid < cnt) {
+          if (active) {
             u32 ci = cb_base + atomicAdd(&cb_used, 1u);
-            Result r = dispatch_split(buf[cur][tid], S.heap, hp, S.conts, ci);
+            Result r = dispatch_split(my_task, S.heap, hp, S.conts, ci);
             if (r.tag == R_SPLIT) {
               u32 j = atomicAdd(&cnt_new, 2u);
-              buf[1 - cur][j] = r.t0;
-              buf[1 - cur][j + 1] = r.t1;
+              buf[j] = r.t0;
+              buf[j + 1] = r.t1;
             } else if (r.tag == R_CALL) {
               u32 j = atomicAdd(&cnt_new, 1u);
-              buf[1 - cur][j] = r.t0;
+              buf[j] = r.t0;
             }
           }
           __syncthreads();
-          cur = 1 - cur;
           if (tid == 0) {
             cnt = cnt_new;
           }
@@ -760,7 +764,7 @@ __global__ void evaluator(State S) {
         }
 
         if (tid < cnt) {
-          S.flat[tid] = buf[cur][tid];
+          S.flat[tid] = buf[tid];
         }
         if (tid == 0) {
           *S.flat_cnt = cnt;
@@ -789,7 +793,8 @@ __global__ void evaluator(State S) {
     // GROW
     // ----
     // Each block loads its share of the flat buffer and iteratively splits
-    // until it has BLOCK_SIZE tasks.
+    // until it has BLOCK_SIZE tasks. Uses single-buffer with read-to-
+    // register to avoid double-buffering.
 
     {
       u32 per = fc / NUM_BLOCKS;
@@ -798,7 +803,7 @@ __global__ void evaluator(State S) {
       u32 my_off = bid * per + ((u32)bid < extra ? (u32)bid : extra);
 
       if (tid < my_n) {
-        buf[0][tid] = S.flat[my_off + tid];
+        buf[tid] = S.flat[my_off + tid];
       }
       if (tid == 0) {
         cnt = my_n;
@@ -807,37 +812,34 @@ __global__ void evaluator(State S) {
       }
       __syncthreads();
 
-      int cur = 0;
-
       for (int i = 0; i < 32 && cnt > 0 && cnt <= (u32)(BLOCK_SIZE / 2); i++) {
+        Task my_task;
+        bool active = (tid < cnt);
+        if (active) {
+          my_task = buf[tid];
+        }
         if (tid == 0) {
           cnt_new = 0;
         }
         __syncthreads();
 
-        if (tid < cnt) {
+        if (active) {
           u32 ci = cb_base + atomicAdd(&cb_used, 1u);
-          Result r = dispatch_split(buf[cur][tid], S.heap, hp, S.conts, ci);
+          Result r = dispatch_split(my_task, S.heap, hp, S.conts, ci);
           if (r.tag == R_SPLIT) {
             u32 j = atomicAdd(&cnt_new, 2u);
-            buf[1 - cur][j] = r.t0;
-            buf[1 - cur][j + 1] = r.t1;
+            buf[j] = r.t0;
+            buf[j + 1] = r.t1;
           } else if (r.tag == R_CALL) {
             u32 j = atomicAdd(&cnt_new, 1u);
-            buf[1 - cur][j] = r.t0;
+            buf[j] = r.t0;
           }
         }
         __syncthreads();
-        cur = 1 - cur;
         if (tid == 0) {
           cnt = cnt_new;
         }
         __syncthreads();
-      }
-
-      // Save cur so WORK can read tasks from buf[cur][tid].
-      if (tid == 0) {
-        grow_cur = cur;
       }
 
 #ifdef DEBUG_MATRIX
@@ -845,7 +847,6 @@ __global__ void evaluator(State S) {
         S.block_cnt[bid] = cnt;
       }
 #endif
-      __syncthreads();
     }
 
 #ifdef DEBUG_MATRIX
@@ -868,10 +869,15 @@ __global__ void evaluator(State S) {
     // WORK
     // ----
     // Each thread runs its task sequentially, then resolves continuations.
-    // New tasks from fired continuations go to the flat buffer for the
-    // next round.
+    // New tasks from fired continuations are collected in buf[] (reused
+    // from GROW) and then flushed to the flat buffer.
 
     {
+      Task my_task;
+      bool active = (tid < cnt);
+      if (active) {
+        my_task = buf[tid];
+      }
       if (tid == 0) {
         out_n = 0;
       }
@@ -879,10 +885,9 @@ __global__ void evaluator(State S) {
 
       u32 clp = 0, cle = 0;
 
-      if (tid < cnt) {
-        Task task = buf[grow_cur][tid];
-        u64 val = dispatch_seq(task, S.heap, hp);
-        resolve(task.ret, val, S.heap, hp, S.conts, clp, cle, S.cont_bump, out, &out_n, S.done, S.result);
+      if (active) {
+        u64 val = dispatch_seq(my_task, S.heap, hp);
+        resolve(my_task.ret, val, S.heap, hp, S.conts, clp, cle, S.cont_bump, buf, &out_n, S.done, S.result);
       }
       __syncthreads();
 
@@ -892,7 +897,7 @@ __global__ void evaluator(State S) {
       }
       __syncthreads();
       for (u32 i = tid; i < n; i += BLOCK_SIZE) {
-        S.flat[out_base + i] = out[i];
+        S.flat[out_base + i] = buf[i];
       }
     }
 
