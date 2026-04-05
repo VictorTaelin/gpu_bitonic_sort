@@ -15,6 +15,7 @@
 
 typedef unsigned long long u64;
 typedef unsigned int    u32;
+typedef unsigned short   u16;
 
 // ════════════════════════════════════════════════════════════════════════════
 // Tree encoding  (u64, bit-63 tag)
@@ -31,14 +32,15 @@ __host__ __device__ inline u32 GetIdx(u64 t) { return (u32)(t & 0x7FFFFFFFu); }
 // Tunables
 // ════════════════════════════════════════════════════════════════════════════
 #define HEAP_SIZE     (1u << 30)  // u64 slots  (~8 GB)
-#define CONT_BUF_SIZE   (1u << 23)  // 8 M continuations
+#define CONT_BUF_SIZE   (1u << 24)  // 16 M continuations
 #define QUEUE_BUF_SIZE  (1u << 22)  // 4 M global-queue entries
-#define NUM_BLOCKS    64
+#define NUM_BLOCKS    48
 #define BLOCK_SIZE    256
 #define NUM_THREADS    (NUM_BLOCKS * BLOCK_SIZE)
-#define ALLOC_CHUNK    256      // per-thread bump chunk (u64 slots)
-#define SEQ_CUTOFF    4       // sort/flow/swap ≤ this depth → sequential
-#define IDLE_POLL_MASK  127      // check global queue every (mask+1) idle spins
+#define ALLOC_CHUNK    1024     // per-thread bump chunk (u64 slots)
+#define CONT_CHUNK    256      // per-thread cont bump chunk
+#define SEQ_CUTOFF    3       // sort/flow/swap ≤ this depth → sequential
+#define IDLE_POLL_MASK  31      // check global queue every (mask+1) idle spins
 
 // Function IDs  (matching the design in AGENTS.md)
 #define FN_SORT       0  // sort(d, s, t)
@@ -58,14 +60,15 @@ __host__ __device__ inline u32 GetIdx(u64 t) { return (u32)(t & 0x7FFFFFFFu); }
 // Structs
 // ════════════════════════════════════════════════════════════════════════════
 struct Task { u32 fn, ret; u64 args[4]; };
-struct Cont { u32 fn, pending, ret, _pad; u64 args[4]; };
+// Compact cont: 32 bytes instead of 48. Creation-time constants (d,s)
+// stored as u16 a0,a1; only 2 result slots instead of 4.
+struct Cont { u32 pending, ret; u16 fn, a0, a1, _pad; u64 args[2]; };
 struct Result { u32 tag; u64 value; Task t0, t1; };
 
 struct GState {
   u64 *heap;  u32 *heap_bump;
   Cont *conts; u32 *cont_bump;
   Task *gqueue; u32 *gqueue_ready, *gqueue_push, *gqueue_pop;
-  u32 *mbox_ready; Task *mbox;
   u32 *done; u64 *result;
 };
 
@@ -82,14 +85,18 @@ __device__ inline u32 heap_alloc(u32 n, u32 &lp, u32 &le, u32 *g) {
 __device__ inline u32 mk_nd(u64 l, u64 r, u64 *H, u32 &lp, u32 &le, u32 *B) {
   u32 i = heap_alloc(2,lp,le,B); H[i]=l; H[i+1]=r; return i;
 }
+__device__ inline u32 cont_alloc(u32 &cp, u32 &ce, u32 *cb) {
+  if (cp >= ce) { cp = atomicAdd(cb,(u32)CONT_CHUNK); ce = cp+CONT_CHUNK; }
+  return cp++;
+}
 __device__ inline u32 alloc_cont(u32 fn,u32 pend,u32 ret,
-    u64 a0,u64 a1,u64 a2,u64 a3, Cont*cs, u32*cb) {
-  u32 ci = atomicAdd(cb,1u); Cont*c=&cs[ci];
-  c->fn=fn; c->pending=pend; c->ret=ret; c->_pad=0;
-  c->args[0]=a0; c->args[1]=a1; c->args[2]=a2; c->args[3]=a3;
+    u32 a0,u32 a1, Cont*cs, u32*cb, u32 &cp, u32 &ce) {
+  u32 ci = cont_alloc(cp,ce,cb); Cont*c=&cs[ci];
+  c->pending=pend; c->ret=ret; c->fn=(u16)fn; c->a0=(u16)a0; c->a1=(u16)a1; c->_pad=0;
+  c->args[0]=0; c->args[1]=0;
   return ci;
 }
-__device__ inline u32  enc_ret(u32 ci,u32 s) { return (ci<<2)|s; }
+__device__ inline u32  enc_ret(u32 ci,u32 s) { return (ci<<1)|s; }
 __device__ inline Result mk_value(u64 v) { Result r; r.tag=R_VALUE; r.value=v; return r; }
 __device__ inline Result mk_split(Task a,Task b) { Result r; r.tag=R_SPLIT; r.t0=a; r.t1=b; return r; }
 __device__ inline Result mk_call (Task a)     { Result r; r.tag=R_CALL;  r.t0=a; return r; }
@@ -125,15 +132,16 @@ __device__ bool gqueue_pop(GState &gs, Task *out) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Task push  (XOR-probe mailbox → global queue)
+// Task push  (XOR-probe shared-memory mailbox → global queue)
 // ════════════════════════════════════════════════════════════════════════════
-__device__ void push_task(GState &gs, Task &task, int tid, int bid) {
-  int base = bid * BLOCK_SIZE;
+__device__ void push_task(GState &gs, Task &task, int tid, int bid,
+             u32 *s_mbox_flag, Task *s_mbox_task) {
   for (int d = 1; d <= 128; d <<= 1) {
-    int tgt = base + (tid ^ d);
-    if (atomicCAS(&gs.mbox_ready[tgt], 0u, 1u) == 0u) {
-      gs.mbox[tgt] = task; __threadfence();
-      atomicExch(&gs.mbox_ready[tgt], 2u); return;
+    int tgt = tid ^ d;
+    if (atomicCAS(&s_mbox_flag[tgt], 0u, 1u) == 0u) {
+      s_mbox_task[tgt] = task;
+      __threadfence_block();
+      atomicExch(&s_mbox_flag[tgt], 2u); return;
     }
   }
   gqueue_push(gs, task);
@@ -147,17 +155,17 @@ __device__ bool resolve_value(GState &gs, u32 ret, u64 val, Task *out) {
     *(volatile u64*)gs.result = val; __threadfence();
     atomicExch(gs.done, 1u); return false;
   }
-  u32 ci = ret >> 2, slot = ret & 3;
+  u32 ci = ret >> 1, slot = ret & 1;
   Cont *co = &gs.conts[ci];
   *(volatile u64*)&co->args[slot] = val; __threadfence();
   u32 old = atomicSub(&co->pending, 1u);
   if (old == 1u) {
     __threadfence();
     out->fn  = co->fn;  out->ret = co->ret;
-    out->args[0] = *(volatile u64*)&co->args[0];
-    out->args[1] = *(volatile u64*)&co->args[1];
-    out->args[2] = *(volatile u64*)&co->args[2];
-    out->args[3] = *(volatile u64*)&co->args[3];
+    out->args[0] = (u64)co->a0;
+    out->args[1] = (u64)co->a1;
+    out->args[2] = *(volatile u64*)&co->args[0];
+    out->args[3] = *(volatile u64*)&co->args[1];
     return true;
   }
   return false;
@@ -217,58 +225,55 @@ __device__ u64 d_sort(u32 d, u32 s, u64 t, u64 *H, u32 &lp, u32 &le, u32 *B) {
 // Task functions
 // ════════════════════════════════════════════════════════════════════════════
 __device__ Result flow_impl(u32 d, u32 s, u64 t, u32 ret,
-               GState &gs, u32 &lp, u32 &le);
+               GState &gs, u32 &lp, u32 &le, u32 &cp, u32 &ce);
 
 // ── sort(d, s, t) ─────────────────────────────────────────────────────────
-__device__ Result fn_sort(u64 *a, u32 ret, GState &gs, u32 &lp, u32 &le) {
+__device__ Result fn_sort(u64 *a, u32 ret, GState &gs, u32 &lp, u32 &le, u32 &cp, u32 &ce) {
   u32 d=(u32)a[0], s=(u32)a[1]; u64 t=a[2];
   if (d==0 || IsLeaf(t)) return mk_value(t);
   if (d <= SEQ_CUTOFF)   return mk_value(d_sort(d,s,t,gs.heap,lp,le,gs.heap_bump));
   u64 l = gs.heap[GetIdx(t)], r = gs.heap[GetIdx(t)+1];
-  u32 ci = alloc_cont(FN_SORT_CONT,2,ret,(u64)d,(u64)s,0,0,gs.conts,gs.cont_bump);
-  return mk_split(mk_task(FN_SORT,enc_ret(ci,2),(u64)(d-1),0ULL,l,0),
-          mk_task(FN_SORT,enc_ret(ci,3),(u64)(d-1),1ULL,r,0));
+  u32 ci = alloc_cont(FN_SORT_CONT,2,ret,d,s,gs.conts,gs.cont_bump,cp,ce);
+  return mk_split(mk_task(FN_SORT,enc_ret(ci,0),(u64)(d-1),0ULL,l,0),
+          mk_task(FN_SORT,enc_ret(ci,1),(u64)(d-1),1ULL,r,0));
 }
 
 // ── sort_cont(d, s, sl, sr) → flow(d, s, Node(sl,sr)) ────────────────────
-__device__ Result fn_sort_cont(u64 *a, u32 ret, GState &gs, u32 &lp, u32 &le) {
+__device__ Result fn_sort_cont(u64 *a, u32 ret, GState &gs, u32 &lp, u32 &le, u32 &cp, u32 &ce) {
   u32 d=(u32)a[0], s=(u32)a[1]; u64 sl=a[2], sr=a[3];
   u32 ni = mk_nd(sl,sr,gs.heap,lp,le,gs.heap_bump);
-  return flow_impl(d, s, MkNode(ni), ret, gs, lp, le);
+  return flow_impl(d, s, MkNode(ni), ret, gs, lp, le, cp, ce);
 }
 
 // ── flow_impl  (shared by fn_flow and fn_sort_cont) ───────────────────────
 __device__ Result flow_impl(u32 d, u32 s, u64 t, u32 ret,
-               GState &gs, u32 &lp, u32 &le) {
+               GState &gs, u32 &lp, u32 &le, u32 &cp, u32 &ce) {
   if (d==0 || IsLeaf(t)) return mk_value(t);
   if (d <= SEQ_CUTOFF)   return mk_value(d_flow(d,s,t,gs.heap,lp,le,gs.heap_bump));
-  // flow first does swap, then down.
-  // swap(s, t)  with depth hint d-1 for the cutoff.
-  u32 ci = alloc_cont(FN_FLOW_AFTER_SWAP,1,ret,(u64)d,(u64)s,0,0,
-            gs.conts,gs.cont_bump);
-  return mk_call(mk_task(FN_SWAP, enc_ret(ci,2), (u64)s, t, (u64)(d-1), 0));
+  u32 ci = alloc_cont(FN_FLOW_AFTER_SWAP,1,ret,d,s,gs.conts,gs.cont_bump,cp,ce);
+  return mk_call(mk_task(FN_SWAP, enc_ret(ci,0), (u64)s, t, (u64)(d-1), 0));
 }
 
 // ── flow(d, s, t) ─────────────────────────────────────────────────────────
-__device__ Result fn_flow(u64 *a, u32 ret, GState &gs, u32 &lp, u32 &le) {
+__device__ Result fn_flow(u64 *a, u32 ret, GState &gs, u32 &lp, u32 &le, u32 &cp, u32 &ce) {
   u32 d=(u32)a[0], s=(u32)a[1]; u64 t=a[2];
   if (d==0 || IsLeaf(t)) return mk_value(t);
   if (d <= SEQ_CUTOFF)   return mk_value(d_flow(d,s,t,gs.heap,lp,le,gs.heap_bump));
-  return flow_impl(d, s, t, ret, gs, lp, le);
+  return flow_impl(d, s, t, ret, gs, lp, le, cp, ce);
 }
 
 // ── flow_after_swap(d, s, t_swapped, _) → down ───────────────────────────
-__device__ Result fn_flow_after_swap(u64 *a, u32 ret, GState &gs, u32 &lp, u32 &le) {
+__device__ Result fn_flow_after_swap(u64 *a, u32 ret, GState &gs, u32 &lp, u32 &le, u32 &cp, u32 &ce) {
   u32 d=(u32)a[0], s=(u32)a[1]; u64 t=a[2];
   if (IsLeaf(t)) return mk_value(t);
   u64 l = gs.heap[GetIdx(t)], r = gs.heap[GetIdx(t)+1];
-  u32 ci = alloc_cont(FN_FLOW_JOIN,2,ret,0,0,0,0,gs.conts,gs.cont_bump);
-  return mk_split(mk_task(FN_FLOW,enc_ret(ci,2),(u64)(d-1),(u64)s,l,0),
-          mk_task(FN_FLOW,enc_ret(ci,3),(u64)(d-1),(u64)s,r,0));
+  u32 ci = alloc_cont(FN_FLOW_JOIN,2,ret,0,0,gs.conts,gs.cont_bump,cp,ce);
+  return mk_split(mk_task(FN_FLOW,enc_ret(ci,0),(u64)(d-1),(u64)s,l,0),
+          mk_task(FN_FLOW,enc_ret(ci,1),(u64)(d-1),(u64)s,r,0));
 }
 
 // ── flow_join(_, _, fl, fr) → Node(fl,fr) ─────────────────────────────────
-__device__ Result fn_flow_join(u64 *a, u32 ret, GState &gs, u32 &lp, u32 &le) {
+__device__ Result fn_flow_join(u64 *a, u32 ret, GState &gs, u32 &lp, u32 &le, u32 &cp, u32 &ce) {
   return mk_value(MkNode(mk_nd(a[2],a[3],gs.heap,lp,le,gs.heap_bump)));
 }
 
@@ -280,7 +285,7 @@ __device__ Result fn_flow_join(u64 *a, u32 ret, GState &gs, u32 &lp, u32 &le) {
 // depth_hint is carried solely so the sequential cutoff can fire; it does
 // not change the computed result.
 //
-__device__ Result fn_swap(u64 *a, u32 ret, GState &gs, u32 &lp, u32 &le) {
+__device__ Result fn_swap(u64 *a, u32 ret, GState &gs, u32 &lp, u32 &le, u32 &cp, u32 &ce) {
   u32 s = (u32)a[0];
   u64 t = a[1];
   u32 depth = (u32)a[2]; // depth of children of t (= warp recursion depth)
@@ -312,14 +317,14 @@ __device__ Result fn_swap(u64 *a, u32 ret, GState &gs, u32 &lp, u32 &le) {
   u32 n0 = mk_nd(ll, rl, gs.heap,lp,le,gs.heap_bump);
   u32 n1 = mk_nd(lr, rr, gs.heap,lp,le,gs.heap_bump);
 
-  u32 ci = alloc_cont(FN_SWAP_JOIN,2,ret, (u64)s,0,0,0, gs.conts,gs.cont_bump);
+  u32 ci = alloc_cont(FN_SWAP_JOIN,2,ret,s,0,gs.conts,gs.cont_bump,cp,ce);
   return mk_split(
-    mk_task(FN_SWAP, enc_ret(ci,2), (u64)s, MkNode(n0), (u64)(depth-1), 0),
-    mk_task(FN_SWAP, enc_ret(ci,3), (u64)s, MkNode(n1), (u64)(depth-1), 0));
+    mk_task(FN_SWAP, enc_ret(ci,0), (u64)s, MkNode(n0), (u64)(depth-1), 0),
+    mk_task(FN_SWAP, enc_ret(ci,1), (u64)s, MkNode(n1), (u64)(depth-1), 0));
 }
 
 // ── swap_join(s, _, p0, p1) → unzip ──────────────────────────────────────
-__device__ Result fn_swap_join(u64 *a, u32 ret, GState &gs, u32 &lp, u32 &le) {
+__device__ Result fn_swap_join(u64 *a, u32 ret, GState &gs, u32 &lp, u32 &le, u32 &cp, u32 &ce) {
   u64 p0=a[2], p1=a[3];
   u64 l0=gs.heap[GetIdx(p0)],  l1=gs.heap[GetIdx(p1)];
   u64 r0=gs.heap[GetIdx(p0)+1], r1=gs.heap[GetIdx(p1)+1];
@@ -331,15 +336,15 @@ __device__ Result fn_swap_join(u64 *a, u32 ret, GState &gs, u32 &lp, u32 &le) {
 // ════════════════════════════════════════════════════════════════════════════
 // Dispatch
 // ════════════════════════════════════════════════════════════════════════════
-__device__ Result execute_task(Task &task, GState &gs, u32 &lp, u32 &le) {
+__device__ Result execute_task(Task &task, GState &gs, u32 &lp, u32 &le, u32 &cp, u32 &ce) {
   switch (task.fn) {
-    case FN_SORT:       return fn_sort(task.args,task.ret,gs,lp,le);
-    case FN_FLOW:       return fn_flow(task.args,task.ret,gs,lp,le);
-    case FN_SWAP:       return fn_swap(task.args,task.ret,gs,lp,le);
-    case FN_SORT_CONT:    return fn_sort_cont(task.args,task.ret,gs,lp,le);
-    case FN_FLOW_AFTER_SWAP: return fn_flow_after_swap(task.args,task.ret,gs,lp,le);
-    case FN_FLOW_JOIN:    return fn_flow_join(task.args,task.ret,gs,lp,le);
-    case FN_SWAP_JOIN:    return fn_swap_join(task.args,task.ret,gs,lp,le);
+    case FN_SORT:       return fn_sort(task.args,task.ret,gs,lp,le,cp,ce);
+    case FN_FLOW:       return fn_flow(task.args,task.ret,gs,lp,le,cp,ce);
+    case FN_SWAP:       return fn_swap(task.args,task.ret,gs,lp,le,cp,ce);
+    case FN_SORT_CONT:    return fn_sort_cont(task.args,task.ret,gs,lp,le,cp,ce);
+    case FN_FLOW_AFTER_SWAP: return fn_flow_after_swap(task.args,task.ret,gs,lp,le,cp,ce);
+    case FN_FLOW_JOIN:    return fn_flow_join(task.args,task.ret,gs,lp,le,cp,ce);
+    case FN_SWAP_JOIN:    return fn_swap_join(task.args,task.ret,gs,lp,le,cp,ce);
     default:         return mk_value(0);
   }
 }
@@ -347,13 +352,22 @@ __device__ Result execute_task(Task &task, GState &gs, u32 &lp, u32 &le) {
 // ════════════════════════════════════════════════════════════════════════════
 // Kernel
 // ════════════════════════════════════════════════════════════════════════════
-__global__ void bitonic_kernel(GState gs, u64 root_tree, u32 depth) {
+__global__ void bitonic_kernel(GState gs, Task *init_tasks, u32 num_init_tasks) {
   int tid = threadIdx.x, bid = blockIdx.x, gid = bid*BLOCK_SIZE + tid;
+
+  // Shared-memory mailbox: much faster than global memory for intra-block comm
+  __shared__ u32  s_mbox_flag[BLOCK_SIZE];
+  __shared__ Task s_mbox_task[BLOCK_SIZE];
+  s_mbox_flag[tid] = 0;
+  __syncthreads();
+
   u32 lp = 0, le = 0;
+  u32 cp = 0, ce = 0;
   Task my_task; bool have_task = false;
 
-  if (gid == 0) {
-    my_task = mk_task(FN_SORT, ROOT_RET, (u64)depth, 0ULL, root_tree, 0ULL);
+  // Pre-distributed initial tasks: one per block (thread 0 of each block)
+  if (tid == 0 && (u32)bid < num_init_tasks) {
+    my_task = init_tasks[bid];
     have_task = true;
   }
 
@@ -362,11 +376,12 @@ __global__ void bitonic_kernel(GState gs, u64 root_tree, u32 depth) {
     if (*(volatile u32*)gs.done) return;
 
     if (!have_task) {
-      // check mailbox
-      u32 rdy = *(volatile u32*)&gs.mbox_ready[gid];
+      // check shared-memory mailbox (very fast: ~30 cycles vs ~200 for global)
+      u32 rdy = *(volatile u32*)&s_mbox_flag[tid];
       if (rdy == 2u) {
-        __threadfence(); my_task = gs.mbox[gid];
-        atomicExch(&gs.mbox_ready[gid], 0u);
+        __threadfence_block();
+        my_task = s_mbox_task[tid];
+        s_mbox_flag[tid] = 0u;
         have_task = true; idle_spins = 0;
       }
       // periodically check global queue
@@ -380,10 +395,10 @@ __global__ void bitonic_kernel(GState gs, u64 root_tree, u32 depth) {
       if (!have_task) { if (idle_spins > 2000000000u) return; continue; }
     }
 
-    Result res = execute_task(my_task, gs, lp, le);
+    Result res = execute_task(my_task, gs, lp, le, cp, ce);
     switch (res.tag) {
       case R_VALUE: have_task = resolve_value(gs, my_task.ret, res.value, &my_task); break;
-      case R_SPLIT: my_task = res.t0; push_task(gs, res.t1, tid, bid); have_task = true; break;
+      case R_SPLIT: my_task = res.t0; push_task(gs, res.t1, tid, bid, s_mbox_flag, s_mbox_task); have_task = true; break;
       case R_CALL:  my_task = res.t0; have_task = true; break;
     }
   }
@@ -419,6 +434,34 @@ static u64 host_checksum(u64 t, u64 *heap) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Host-side pre-split: distribute initial sort tasks across all blocks
+// ════════════════════════════════════════════════════════════════════════════
+static u32 host_enc_ret(u32 ci, u32 s) { return (ci << 1) | s; }
+
+static void host_presplit(u64 tree, u32 depth, u32 s, u32 ret,
+              int level, int target_level,
+              Cont *conts, int *cont_idx,
+              Task *tasks, int *task_idx) {
+  if (level == target_level || depth <= SEQ_CUTOFF || IsLeaf(tree)) {
+    Task t; t.fn = FN_SORT; t.ret = ret;
+    t.args[0] = (u64)depth; t.args[1] = (u64)s; t.args[2] = tree; t.args[3] = 0;
+    tasks[*task_idx] = t; (*task_idx)++;
+    return;
+  }
+  u32 ci = (u32)(*cont_idx); (*cont_idx)++;
+  Cont *c = &conts[ci];
+  c->pending = 2; c->ret = ret;
+  c->fn = FN_SORT_CONT; c->a0 = (u16)depth; c->a1 = (u16)s; c->_pad = 0;
+  c->args[0] = 0; c->args[1] = 0;
+
+  u64 l = h_heap[GetIdx(tree)], r = h_heap[GetIdx(tree) + 1];
+  host_presplit(l, depth-1, 0, host_enc_ret(ci, 0),
+         level+1, target_level, conts, cont_idx, tasks, task_idx);
+  host_presplit(r, depth-1, 1, host_enc_ret(ci, 1),
+         level+1, target_level, conts, cont_idx, tasks, task_idx);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Main
 // ════════════════════════════════════════════════════════════════════════════
 int main(int argc, char **argv) {
@@ -437,6 +480,20 @@ int main(int argc, char **argv) {
   u64 root = host_gen((u32)DEPTH, 0);
   u32 init_hp = h_heap_ptr;
 
+  // Pre-split sort tree so all blocks start with work
+  // Find largest k where 2^k <= NUM_BLOCKS
+  int presplit_depth = 0;
+  while ((1 << (presplit_depth+1)) <= NUM_BLOCKS) presplit_depth++;
+  if (presplit_depth > DEPTH - SEQ_CUTOFF) presplit_depth = DEPTH - SEQ_CUTOFF;
+  int max_tasks = 1 << (presplit_depth + 1);
+  int max_conts = max_tasks;
+  Task *h_init_tasks = (Task*)calloc(max_tasks, sizeof(Task));
+  Cont *h_init_conts = (Cont*)calloc(max_conts, sizeof(Cont));
+  int n_conts = 0, n_tasks = 0;
+  host_presplit(root, (u32)DEPTH, 0, ROOT_RET, 0, presplit_depth,
+         h_init_conts, &n_conts, h_init_tasks, &n_tasks);
+  fprintf(stderr, " presplit: %d tasks, %d conts (depth %d)\n", n_tasks, n_conts, presplit_depth);
+
   // set stack for recursive device functions
   CHK(cudaDeviceSetLimit(cudaLimitStackSize, 2048));
 
@@ -450,26 +507,33 @@ int main(int argc, char **argv) {
   CHK(cudaMalloc(&gs.gqueue_ready,(size_t)QUEUE_BUF_SIZE*sizeof(u32)));
   CHK(cudaMalloc(&gs.gqueue_push, sizeof(u32)));
   CHK(cudaMalloc(&gs.gqueue_pop, sizeof(u32)));
-  CHK(cudaMalloc(&gs.mbox_ready, (size_t)NUM_THREADS*sizeof(u32)));
-  CHK(cudaMalloc(&gs.mbox,    (size_t)NUM_THREADS*sizeof(Task)));
+
   CHK(cudaMalloc(&gs.done,    sizeof(u32)));
   CHK(cudaMalloc(&gs.result,   sizeof(u64)));
 
   CHK(cudaMemcpy(gs.heap, h_heap, (size_t)init_hp*sizeof(u64), cudaMemcpyHostToDevice));
   CHK(cudaMemcpy(gs.heap_bump, &init_hp, sizeof(u32), cudaMemcpyHostToDevice));
   u32 zero = 0;
-  CHK(cudaMemcpy(gs.cont_bump,  &zero, sizeof(u32), cudaMemcpyHostToDevice));
+  // Upload pre-split conts to device cont buffer
+  if (n_conts > 0)
+    CHK(cudaMemcpy(gs.conts, h_init_conts, (size_t)n_conts*sizeof(Cont), cudaMemcpyHostToDevice));
+  u32 init_conts = (u32)n_conts;
+  CHK(cudaMemcpy(gs.cont_bump, &init_conts, sizeof(u32), cudaMemcpyHostToDevice));
+  // Upload initial tasks
+  Task *d_init_tasks;
+  CHK(cudaMalloc(&d_init_tasks, (size_t)n_tasks*sizeof(Task)));
+  CHK(cudaMemcpy(d_init_tasks, h_init_tasks, (size_t)n_tasks*sizeof(Task), cudaMemcpyHostToDevice));
   CHK(cudaMemcpy(gs.gqueue_push, &zero, sizeof(u32), cudaMemcpyHostToDevice));
   CHK(cudaMemcpy(gs.gqueue_pop, &zero, sizeof(u32), cudaMemcpyHostToDevice));
   CHK(cudaMemcpy(gs.done,    &zero, sizeof(u32), cudaMemcpyHostToDevice));
   CHK(cudaMemset(gs.gqueue_ready, 0, (size_t)QUEUE_BUF_SIZE*sizeof(u32)));
-  CHK(cudaMemset(gs.mbox_ready,  0, (size_t)NUM_THREADS*sizeof(u32)));
+
 
   // launch
   cudaEvent_t ev0, ev1;
   CHK(cudaEventCreate(&ev0)); CHK(cudaEventCreate(&ev1));
   CHK(cudaEventRecord(ev0));
-  bitonic_kernel<<<NUM_BLOCKS, BLOCK_SIZE>>>(gs, root, (u32)DEPTH);
+  bitonic_kernel<<<NUM_BLOCKS, BLOCK_SIZE>>>(gs, d_init_tasks, (u32)n_tasks);
   CHK(cudaEventRecord(ev1));
   CHK(cudaDeviceSynchronize());
   cudaError_t err = cudaGetLastError();
@@ -511,7 +575,7 @@ int main(int argc, char **argv) {
   CHK(cudaFree(gs.conts)); CHK(cudaFree(gs.cont_bump));
   CHK(cudaFree(gs.gqueue)); CHK(cudaFree(gs.gqueue_ready));
   CHK(cudaFree(gs.gqueue_push)); CHK(cudaFree(gs.gqueue_pop));
-  CHK(cudaFree(gs.mbox_ready)); CHK(cudaFree(gs.mbox));
+
   CHK(cudaFree(gs.done)); CHK(cudaFree(gs.result));
   CHK(cudaEventDestroy(ev0)); CHK(cudaEventDestroy(ev1));
   return 0;

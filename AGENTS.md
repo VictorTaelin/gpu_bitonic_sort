@@ -40,10 +40,10 @@
 //  Test: sort(20, 0, gen(20, 0)) — 1M elements, checksum 4027056128
 //
 //  C reference (gcc -O2, single-threaded):  ~2500 ms
-//  GPU current best (64 blocks, mask=127):   ~167 ms  (15x)
-//  GPU committed config (768 blocks, mask=511): ~196 ms  (12.6x)
+//  GPU current best (48 blocks, cutoff=3):    ~92 ms  (27x)
+//  GPU previous  (64 blocks, cutoff=4):     ~167 ms  (15x)
 //
-//  Target: 125 ms (20x)
+//  Target: 125 ms (20x) — ACHIEVED
 //
 // COMPILATION NOTES
 // =================
@@ -260,50 +260,63 @@
 // OPTIMIZATION ROADMAP (runtime-only, no algorithm changes)
 // =========================================================
 //
-//  1. DONE: Sequential cutoff (SEQ_CUTOFF=4)
-//     Reduced conts from ~131M to 5.5M. Massive win.
+//  1. DONE: Sequential cutoff (SEQ_CUTOFF=3)
+//     Cutoff 4→3: reduced from ~167ms to ~92ms. Creates 2^17=131K
+//     sort tasks (vs 2^16=65K at cutoff 4). More parallelism.
+//     Cutoff 2 is worse (130ms, too many conts: 28.7M).
 //
-//  2. DONE: Idle poll frequency tuning (mask=511)
-//     Reduced global queue contention. 2x win from mask=15.
+//  2. DONE: Idle poll frequency tuning (mask=31)
+//     With shared-memory mailbox, idle loops are faster (~30 cycles
+//     vs ~200 for global memory). mask=31 optimal for 48 blocks.
 //
-//  3. TODO: Reduce block count to 64
-//     All blocks guaranteed resident. 15% win.
-//     Update: also adjust IDLE_POLL_MASK to 127 (fewer threads
-//     → less contention → can poll more aggressively).
+//  3. DONE: Reduce block count to 48
+//     With 12K threads, all participate. Sweet spot for work/thread.
+//     32→109ms, 40→97ms, 48→92ms, 56→104ms, 64→117ms.
 //
-//  4. TODO: Reduce register pressure to ≤128 (highest impact)
-//     Enables 2 blocks/SM = 16 warps = 2× latency hiding.
-//     Must be done via code restructuring, NOT compiler flags.
-//     Options:
-//      a) Eliminate Result struct: task functions push 2nd task
-//        directly and overwrite my_task in place.
-//      b) Pack GState into single contiguous allocation with
-//        compile-time offsets from a base pointer.
-//      c) Store frequently-used pointers in shared memory.
-//     Expected impact: ~1.5-2× → ~85-110ms (23-29× vs C)
+//  4. DONE: Shared-memory mailbox
+//     Moved XOR-probe mailbox from global to shared memory.
+//     ~30 cycle atomicCAS vs ~200 in global. 11 KB smem per block.
+//     Side effect: reduced kernel registers 152→102 (GState smaller).
+//     Performance impact: marginal (~2ms), but cleaner code.
 //
-//  5. TODO: Per-block page allocation (as designed in AGENTS.md)
-//     Block collectively grabs heap pages; threads bump locally.
-//     Improves data locality (parent-child nodes on same page)
-//     and reduces global atomicAdds from 3.2M to ~12K.
+//  5. DONE: Compact Cont struct (48→32 bytes)
+//     Pack creation-time args (d, s) as u16 in header instead of
+//     u64 args[]. Only 2 result slots instead of 4.
+//     Saves 33% memory per cont. Performance impact: marginal.
 //
-//  6. MAYBE: Shared-memory work queue per block
-//     Replace global-memory mailbox with shared-memory ring buffer.
-//     Pro: ~10× faster push/pop (shared vs global atomics).
-//     Con: uses shared memory (but only ~2-4 KB).
-//     With good occupancy from (4), this becomes more attractive
-//     since shared memory pressure is the limiting factor.
+//  6. DONE: Per-thread cont allocation (CONT_CHUNK=256)
+//     Like heap allocation: thread-local bump, global atomicAdd
+//     only every 256 conts. Saves ~2ms.
+//
+//  7. DONE: Host-side pre-splitting
+//     Host walks sort tree to depth 5, creating 32 initial sort
+//     tasks + 31 continuations. All blocks start with work from
+//     the first cycle. Saves ~3ms vs single-root-task startup.
+//
+//  8. DONE: ALLOC_CHUNK=1024 (from 256)
+//     Fewer global atomicAdds on heap_bump. ~2ms improvement.
 //
 // THINGS THAT DON'T WORK (tried and measured)
 // ===========================================
 //  - u32 tree encoding: 3× slower (implementation issues, not fundamental)
 //  - -arch=sm_89: 35% slower than JIT from sm_52 (worse spilling)
-//  - Increasing SWAP_SEQ_CUTOFF beyond 4: makes swap sequential on one
-//    thread, which is catastrophically slow for deep swaps (10-13 seconds
-//    for cutoff=16-19). The swap MUST be parallelized through the task system.
-//  - ALLOC_CHUNK=64: slightly slower than 256 (more atomic contention)
-//  - ALLOC_CHUNK=512: similar to 256 (diminishing returns)
-//  - Aggressive idle polling (mask=7): 2× slower (atomic contention)
+//  - Increasing SWAP_SEQ_CUTOFF beyond 3: makes swap sequential on one
+//    thread, catastrophically slow (cutoff 4→148ms, 5→210ms, 8→1300ms).
+//    The swap MUST be parallelized through the task system.
+//  - --maxrregcount=128: spill traffic overwhelms occupancy gain
+//  - __launch_bounds__(256,2): 128 regs, no spill, but no perf gain
+//    (48 blocks can't fill 2 blocks/SM on 128 SMs)
+//  - __noinline__ on execute_task: 126 regs but stack overhead → -5%
+//  - Cross-block mailbox probing: random writes to other blocks'
+//    mailboxes. No benefit, just adds latency.
+//  - Shorter XOR probe distance (d≤4): more global queue overflow,
+//    contention kills performance (212ms at d≤4 vs 167ms at d≤128)
+//  - More blocks (>48): work doesn't spread due to top-level flow
+//    serialization. Even with presplit, 128 blocks → 248ms.
+//  - Pre-splitting to more blocks: top-level flow operations are
+//    serialized on whichever block resolves the continuation.
+//    More blocks = more idle blocks waiting for top-level flow.
+//  - Aggressive idle polling (mask=7): contention on global queue
 
 // Our goal is to implement a general-purpose parallel evaluator for a pure
 // functional language in CUDA. In order to start our work, we designed the
