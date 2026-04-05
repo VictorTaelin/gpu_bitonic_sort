@@ -15,17 +15,11 @@
 //
 // From bitonic.c (cannot be changed):
 //
-//   gen(d, x):
-//     if d == 0: return Leaf(x)
-//     l = gen(d-1, x*2+1)                    // PARALLEL
-//     r = gen(d-1, x*2)                      // PARALLEL
-//     return Node(l, r)
-//
-//   sort(d, s, t):
-//     if d == 0 or is_leaf(t): return t
-//     l = sort(d-1, 0, left(t))              // PARALLEL
-//     r = sort(d-1, 1, right(t))             // PARALLEL
-//     return flow(d, s, Node(l, r))
+//   warp(d, s, a, b):
+//     if d == 0: compare-and-swap leaves
+//     l = warp(d-1, s, left(a),  left(b))    // PARALLEL
+//     r = warp(d-1, s, right(a), right(b))   // PARALLEL
+//     return Node(Node(left(l),left(r)), Node(right(l),right(r)))
 //
 //   flow(d, s, t):
 //     if d == 0 or is_leaf(t): return t
@@ -38,11 +32,17 @@
 //     r = flow(d-1, s, right(t))             // PARALLEL
 //     return Node(l, r)
 //
-//   warp(d, s, a, b):
-//     if d == 0: compare-and-swap leaves
-//     l = warp(d-1, s, left(a),  left(b))    // PARALLEL
-//     r = warp(d-1, s, right(a), right(b))   // PARALLEL
-//     return Node(Node(left(l),left(r)), Node(right(l),right(r)))
+//   sort(d, s, t):
+//     if d == 0 or is_leaf(t): return t
+//     l = sort(d-1, 0, left(t))              // PARALLEL
+//     r = sort(d-1, 1, right(t))             // PARALLEL
+//     return flow(d, s, Node(l, r))
+//
+//   gen(d, x):
+//     if d == 0: return Leaf(x)
+//     l = gen(d-1, x*2+1)                    // PARALLEL
+//     r = gen(d-1, x*2)                      // PARALLEL
+//     return Node(l, r)
 //
 //   checksum(t, d):
 //     if d == 0: return val(t)
