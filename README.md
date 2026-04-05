@@ -86,17 +86,17 @@ All three produce checksum `4027056128` for depth 20.
 
 ## Benchmarks
 
-Depth 20 (1,048,576 elements), sorting only:
+Sorting only, measured on AMD Ryzen 9 7900X + NVIDIA RTX 4090:
 
-| Implementation | Chip                         | Time     | vs C     |
-|----------------|------------------------------|----------|----------|
-| C (gcc -O2)    | AMD Ryzen 9 7900X (1 thread) | 2,475 ms | 1x       |
-| CUDA           | NVIDIA RTX 4090 (128 SMs)    | 38.5 ms  | **64x**  |
+| Depth | Elements  | C (1 thread) | CUDA (128 SMs) | Speedup  |
+|-------|-----------|--------------|----------------|----------|
+| 20    | 1,048,576 | 2,475 ms     | 36.7 ms        | **67x**  |
+| 21    | 2,097,152 | 5,546 ms     | 88.3 ms        | **63x**  |
 
-Full GPU phase breakdown:
+Full GPU phase breakdown (depth 20):
 
 | Phase    | Time    |
 |----------|---------|
-| gen      | 0.4 ms  |
-| sort     | 38.5 ms |
+| gen      | 0.2 ms  |
+| sort     | 36.7 ms |
 | checksum | 0.8 ms  |
