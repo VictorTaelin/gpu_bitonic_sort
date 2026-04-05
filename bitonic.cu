@@ -115,6 +115,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
 
@@ -130,11 +131,12 @@ typedef unsigned short     u16;
 #define NUM_BLOCKS 128
 #define BLOCK_SIZE 256
 #define NUM_SLOTS  (NUM_BLOCKS * BLOCK_SIZE)
-#define HEAP_SIZE  (1u << 31)
 #define HEAP_CHUNK 4096
-#define CONT_CAP   (1u << 25)
 #define CONT_CHUNK 2
-#define GSTK_SIZE  (1ull << 32)
+
+// Global stack: 128 MB safety net (1024 words = 256 frames per thread).
+// Shared memory handles D<=21; this catches deeper recursion.
+#define GSTK_SIZE  (1ull << 27)
 #define GSTK_WORDS (GSTK_SIZE / NUM_SLOTS / sizeof(u32))
 
 // Shared memory stack: first STK_WORDS of each thread's stack live here.
@@ -336,6 +338,12 @@ inline void cuda_check(cudaError_t err, const char *file, int line) {
   }
 }
 #define CHK(x) cuda_check((x), __FILE__, __LINE__)
+
+static double now_ms() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000.0 + ts.tv_nsec * 1e-6;
+}
 
 // Compiled Functions
 // ==================
@@ -1161,6 +1169,18 @@ __global__ void evaluator(State S) {
   S.heap_ends[sid] = he;
 }
 
+// Heap init kernel: sets up per-thread chunk assignments on GPU.
+__global__ void init_heap(u32 *ptrs, u32 *ends, u32 *bump) {
+  int sid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (sid < NUM_SLOTS) {
+    ptrs[sid] = (u32)sid * HEAP_CHUNK;
+    ends[sid] = (u32)(sid + 1) * HEAP_CHUNK;
+  }
+  if (sid == 0) {
+    *bump = NUM_SLOTS * HEAP_CHUNK;
+  }
+}
+
 // Host
 // ====
 
@@ -1185,13 +1205,10 @@ static void run(State &S, u32 fn, u64 a0, u64 a1, float *ms) {
     cudaSharedmemCarveoutMaxL1));
 
   void *args[] = { &S };
-  cudaEvent_t t0, t1;
-  CHK(cudaEventCreate(&t0));
-  CHK(cudaEventCreate(&t1));
-  CHK(cudaEventRecord(t0));
+  double w0 = now_ms();
   CHK(cudaLaunchCooperativeKernel((void *)evaluator, NUM_BLOCKS, BLOCK_SIZE, args));
-  CHK(cudaEventRecord(t1));
   CHK(cudaDeviceSynchronize());
+  double w1 = now_ms();
 
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
@@ -1199,9 +1216,7 @@ static void run(State &S, u32 fn, u64 a0, u64 a1, float *ms) {
     exit(1);
   }
 
-  CHK(cudaEventElapsedTime(ms, t0, t1));
-  CHK(cudaEventDestroy(t0));
-  CHK(cudaEventDestroy(t1));
+  *ms = (float)(w1 - w0);
 }
 
 int main(int argc, char **argv) {
@@ -1217,16 +1232,20 @@ int main(int argc, char **argv) {
   fprintf(stderr, "Bitonic sort  depth=%d  elems=%u  (%d blocks × %d threads)\n",
           depth, 1u << depth, NUM_BLOCKS, BLOCK_SIZE);
 
-  CHK(cudaDeviceSetLimit(cudaLimitStackSize, 1024));
+  // Size heap and continuations based on depth.
+  // N<=20: 8 GB heap, 16M conts (512 MB)  → total ~8.6 GB (fast cudaMalloc)
+  // N>=21: 16 GB heap, 32M conts (1 GB)   → total ~17 GB
+  size_t heap_entries = (depth <= 20) ? (1ull << 30) : (1ull << 31);
+  size_t cont_cap    = (depth <= 20) ? (1ull << 24) : (1ull << 25);
 
   // Allocate all GPU memory in one call.
   #define ALIGN(x) (((x) + 255) & ~(size_t)255)
   size_t off = 0;
-  size_t p_heap = off; off += ALIGN((size_t)HEAP_SIZE * 8);
+  size_t p_heap = off; off += ALIGN(heap_entries * 8);
   size_t p_hptr = off; off += ALIGN((size_t)NUM_SLOTS * 4);
   size_t p_hend = off; off += ALIGN((size_t)NUM_SLOTS * 4);
   size_t p_hbmp = off; off += ALIGN(4);
-  size_t p_cont = off; off += ALIGN((size_t)CONT_CAP * sizeof(Cont));
+  size_t p_cont = off; off += ALIGN(cont_cap * sizeof(Cont));
   size_t p_cbmp = off; off += ALIGN(4);
   size_t p_task = off; off += ALIGN((size_t)NUM_SLOTS * sizeof(Task));
   size_t p_flat = off; off += ALIGN((size_t)NUM_SLOTS * sizeof(Task));
@@ -1238,7 +1257,6 @@ int main(int argc, char **argv) {
 
   char *mem;
   CHK(cudaMalloc(&mem, off));
-  CHK(cudaMemset(mem, 0, off));
 
   State S;
   S.heap      = (u64  *)(mem + p_heap);
@@ -1255,21 +1273,9 @@ int main(int argc, char **argv) {
   S.result    = (u64  *)(mem + p_res);
   S.gstk      = (u32  *)(mem + p_gstk);
 
-  // Initialize chunked heap allocator: pre-assign one chunk per thread.
-  u32 *hps = (u32 *)malloc(NUM_SLOTS * sizeof(u32));
-  u32 *hes = (u32 *)malloc(NUM_SLOTS * sizeof(u32));
-  for (int i = 0; i < NUM_SLOTS; i++) {
-    hps[i] = (u32)i * HEAP_CHUNK;
-    hes[i] = (u32)(i + 1) * HEAP_CHUNK;
-  }
-  CHK(cudaMemcpy(S.heap_ptrs, hps, NUM_SLOTS * sizeof(u32), cudaMemcpyHostToDevice));
-  CHK(cudaMemcpy(S.heap_ends, hes, NUM_SLOTS * sizeof(u32), cudaMemcpyHostToDevice));
-  free(hps);
-  free(hes);
-
-  // Global bump starts past all pre-assigned chunks.
-  u32 bump_init = NUM_SLOTS * HEAP_CHUNK;
-  CHK(cudaMemcpy(S.heap_bump, &bump_init, sizeof(u32), cudaMemcpyHostToDevice));
+  // Initialize chunked heap allocator on GPU.
+  init_heap<<<(NUM_SLOTS + 255) / 256, 256>>>(S.heap_ptrs, S.heap_ends, S.heap_bump);
+  CHK(cudaDeviceSynchronize());
 
   // Run: gen -> sort -> checksum.
   float ms;
@@ -1289,6 +1295,6 @@ int main(int argc, char **argv) {
 
   printf("%u\n", (u32)cksum);
 
-  CHK(cudaFree(mem));
+  // Skip cudaFree -- process exit reclaims GPU memory faster.
   return 0;
 }
