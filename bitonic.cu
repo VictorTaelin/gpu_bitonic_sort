@@ -731,6 +731,29 @@ ENTER_WARP:
     }
     goto POP;
   }
+  if (d == 1) {
+    // Inline warp(1): 2 compare-and-swaps entirely in registers.
+    // At d==1, a and b are nodes whose children are leaves.
+    u32 ai = get_idx(a);
+    u32 bi = get_idx(b);
+    u32 a0 = get_val(H[ai]);      // left child of a
+    u32 a1 = get_val(H[ai + 1]);  // right child of a
+    u32 b0 = get_val(H[bi]);      // left child of b
+    u32 b1 = get_val(H[bi + 1]);  // right child of b
+    // Compare-and-swap left pair (a0, b0)
+    u32 sw0 = s ^ (a0 > b0 ? 1u : 0u);
+    u32 lo0 = sw0 ? b0 : a0;
+    u32 hi0 = sw0 ? a0 : b0;
+    // Compare-and-swap right pair (a1, b1)
+    u32 sw1 = s ^ (a1 > b1 ? 1u : 0u);
+    u32 lo1 = sw1 ? b1 : a1;
+    u32 hi1 = sw1 ? a1 : b1;
+    // Rearrange: Node(Node(lo0, lo1), Node(hi0, hi1))
+    u32 li = alloc_node(make_leaf(lo0), make_leaf(lo1), H, hp, he, hb);
+    u32 ri = alloc_node(make_leaf(hi0), make_leaf(hi1), H, hp, he, hb);
+    res = make_node(alloc_node(make_node(li), make_node(ri), H, hp, he, hb));
+    goto POP;
+  }
   {
     u32 ai = get_idx(a);
     u32 bi = get_idx(b);
